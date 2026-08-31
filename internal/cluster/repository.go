@@ -21,8 +21,10 @@ import (
 )
 
 type Repository struct {
-	db            *gorm.DB
-	cpaSnapshotMu sync.Mutex
+	db                 *gorm.DB
+	cpaSnapshotMu      sync.Mutex
+	sessionRootCacheMu sync.RWMutex
+	sessionRootCache   map[string]string
 }
 
 type UpsertResult string

@@ -11,18 +11,21 @@ type sessionEntry struct {
 	expiresAt time.Time
 }
 
+const defaultMaxSessionCacheEntries = 65536
+
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
 type SessionCache struct {
-	mu      sync.RWMutex
-	entries map[string]sessionEntry
-	ttl     time.Duration
-	stopCh  chan struct{}
+	mu       sync.RWMutex
+	entries  map[string]sessionEntry
+	ttl      time.Duration
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewSessionCache creates a cache with the specified TTL.
 // A background goroutine periodically cleans expired entries.
 func NewSessionCache(ttl time.Duration) *SessionCache {
-	if ttl <= 0 {
+	if ttl < time.Second {
 		ttl = 30 * time.Minute
 	}
 	c := &SessionCache{
@@ -48,7 +51,9 @@ func (c *SessionCache) Get(sessionID string) (string, bool) {
 	}
 	if time.Now().After(entry.expiresAt) {
 		c.mu.Lock()
-		delete(c.entries, sessionID)
+		if cur, exists := c.entries[sessionID]; exists && time.Now().After(cur.expiresAt) {
+			delete(c.entries, sessionID)
+		}
 		c.mu.Unlock()
 		return "", false
 	}
@@ -86,6 +91,25 @@ func (c *SessionCache) Set(sessionID, authID string) {
 		return
 	}
 	c.mu.Lock()
+	if len(c.entries) >= defaultMaxSessionCacheEntries {
+		now := time.Now()
+		pruned := 0
+		for sid, entry := range c.entries {
+			if now.After(entry.expiresAt) {
+				delete(c.entries, sid)
+				pruned++
+			}
+		}
+		if len(c.entries) >= defaultMaxSessionCacheEntries {
+			for sid := range c.entries {
+				delete(c.entries, sid)
+				pruned++
+				if pruned >= defaultMaxSessionCacheEntries/8 {
+					break
+				}
+			}
+		}
+	}
 	c.entries[sessionID] = sessionEntry{
 		authID:    authID,
 		expiresAt: time.Now().Add(c.ttl),
@@ -118,18 +142,20 @@ func (c *SessionCache) InvalidateAuth(authID string) {
 	c.mu.Unlock()
 }
 
-// Stop terminates the background cleanup goroutine.
+// Stop terminates the background cleanup goroutine safely and idempotently.
 func (c *SessionCache) Stop() {
-	select {
-	case <-c.stopCh:
-	default:
+	c.stopOnce.Do(func() {
 		close(c.stopCh)
-	}
+	})
 }
 
 // cleanupLoop removes expired or stale entries.
 func (c *SessionCache) cleanupLoop() {
-	ticker := time.NewTicker(c.ttl / 2)
+	interval := c.ttl / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {

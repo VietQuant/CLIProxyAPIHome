@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
@@ -45,6 +46,9 @@ type UsageObservabilityRecordQuery struct {
 	Status           string
 	StatusCode       *int
 	RequestID        string
+	SessionID        string
+	ParentSessionID  string
+	RootSessionID    string
 	User             string
 	UserID           *uint
 	ClientKey        string
@@ -245,6 +249,9 @@ type UsageObservabilityRecord struct {
 	UsageID            uint
 	Timestamp          time.Time
 	RequestID          string
+	SessionID          string
+	ParentSessionID    string
+	RootSessionID      string
 	UpstreamRequestID  string
 	EventType          string
 	Status             string
@@ -380,6 +387,9 @@ type usageObservabilityRecordRow struct {
 	AuthType                   string          `gorm:"column:auth_type"`
 	RawAPIKey                  string          `gorm:"column:raw_api_key"`
 	RequestID                  string          `gorm:"column:request_id"`
+	SessionID                  string          `gorm:"column:session_id"`
+	ParentSessionID            string          `gorm:"column:parent_session_id"`
+	RootSessionID              string          `gorm:"column:root_session_id"`
 	UpstreamRequestID          string          `gorm:"column:upstream_request_id"`
 	EventType                  string          `gorm:"column:event_type"`
 	UpstreamStatusCode         int             `gorm:"column:upstream_status_code"`
@@ -2125,6 +2135,9 @@ func usageObservabilityRecordSelect() string {
 		"usage"."auth_type" AS auth_type,
 		"usage"."api_key" AS raw_api_key,
 		"usage"."request_id" AS request_id,
+		"usage"."session_id" AS session_id,
+		"usage"."parent_session_id" AS parent_session_id,
+		"usage"."root_session_id" AS root_session_id,
 		"usage"."upstream_request_id" AS upstream_request_id,
 		"usage"."event_type" AS event_type,
 		"usage"."upstream_status_code" AS upstream_status_code,
@@ -2322,6 +2335,15 @@ func usageObservabilityApplyRecordFilters(scope *gorm.DB, query UsageObservabili
 	if requestID := strings.TrimSpace(query.RequestID); requestID != "" {
 		scope = scope.Where(`"usage"."request_id" = ?`, requestID)
 	}
+	if sessionID := strings.TrimSpace(query.SessionID); sessionID != "" {
+		scope = scope.Where(`"usage"."session_id" = ?`, sessionID)
+	}
+	if parentSessionID := strings.TrimSpace(query.ParentSessionID); parentSessionID != "" {
+		scope = scope.Where(`"usage"."parent_session_id" = ?`, parentSessionID)
+	}
+	if rootSessionID := strings.TrimSpace(query.RootSessionID); rootSessionID != "" {
+		scope = scope.Where(`"usage"."root_session_id" = ?`, rootSessionID)
+	}
 	if user := strings.TrimSpace(query.User); user != "" {
 		matcher := "%" + user + "%"
 		scope = scope.Where(`"user"."username" LIKE ? OR CAST("user"."id" AS TEXT) LIKE ?`, matcher, matcher)
@@ -2418,6 +2440,15 @@ func usageObservabilityApplyUsageFilters(scope *gorm.DB, query UsageObservabilit
 	scope = usageObservabilityStatusCodeScope(scope, query.StatusCode)
 	if requestID := strings.TrimSpace(query.RequestID); requestID != "" {
 		scope = scope.Where(`"usage"."request_id" = ?`, requestID)
+	}
+	if sessionID := strings.TrimSpace(query.SessionID); sessionID != "" {
+		scope = scope.Where(`"usage"."session_id" = ?`, sessionID)
+	}
+	if parentSessionID := strings.TrimSpace(query.ParentSessionID); parentSessionID != "" {
+		scope = scope.Where(`"usage"."parent_session_id" = ?`, parentSessionID)
+	}
+	if rootSessionID := strings.TrimSpace(query.RootSessionID); rootSessionID != "" {
+		scope = scope.Where(`"usage"."root_session_id" = ?`, rootSessionID)
 	}
 	if executorType := strings.TrimSpace(query.ExecutorType); executorType != "" {
 		scope = scope.Where(`"usage"."executor_type" = ?`, executorType)
@@ -2628,6 +2659,9 @@ func usageObservabilityRecordFromRow(row *usageObservabilityRecordRow) UsageObse
 		UsageID:            row.UsageID,
 		Timestamp:          row.Timestamp.UTC(),
 		RequestID:          strings.TrimSpace(row.RequestID),
+		SessionID:          strings.TrimSpace(row.SessionID),
+		ParentSessionID:    strings.TrimSpace(row.ParentSessionID),
+		RootSessionID:      strings.TrimSpace(row.RootSessionID),
 		UpstreamRequestID:  SafeQuotaRequestID(firstNonEmptyUsageObservabilityString(row.UpstreamRequestID, firstStringFromPayload(payload, "upstream_request_id", "upstream.request_id", "response.request_id", "response.id"))),
 		EventType:          usageObservabilityEventType(row, payload),
 		Status:             usageObservabilityRecordStatus(row.Failed),
@@ -3949,3 +3983,375 @@ func payloadPathValue(payload map[string]any, path string) any {
 }
 
 const httpStatusOK = 200
+
+type SessionTreeNode struct {
+	SessionID       string                   `json:"session_id"`
+	ParentSessionID string                   `json:"parent_session_id,omitempty"`
+	RootSessionID   string                   `json:"root_session_id"`
+	FirstSeenAt     time.Time                `json:"first_seen_at"`
+	LastSeenAt      time.Time                `json:"last_seen_at"`
+	RequestCount    int64                    `json:"request_count"`
+	TotalLatencyMS  int64                    `json:"total_latency_ms"`
+	InputTokens     int64                    `json:"input_tokens"`
+	OutputTokens    int64                    `json:"output_tokens"`
+	ReasoningTokens int64                    `json:"reasoning_tokens"`
+	CachedTokens    int64                    `json:"cached_tokens"`
+	TotalTokens     int64                    `json:"total_tokens"`
+	FailedCount     int64                    `json:"failed_count"`
+	Children        []*SessionTreeNode       `json:"children,omitempty"`
+	Timeline        []SessionTimelineRequest `json:"timeline,omitempty"`
+}
+
+type SessionTimelineRequest struct {
+	RequestID          string    `json:"request_id"`
+	Turn               int       `json:"turn"`
+	Timestamp          time.Time `json:"timestamp"`
+	Model              string    `json:"model"`
+	Provider           string    `json:"provider"`
+	LatencyMS          int64     `json:"latency_ms"`
+	TTFTMS             int64     `json:"ttft_ms"`
+	InputTokens        int64     `json:"input_tokens"`
+	OutputTokens       int64     `json:"output_tokens"`
+	ReasoningTokens    int64     `json:"reasoning_tokens"`
+	CachedTokens       int64     `json:"cached_tokens"`
+	TotalTokens        int64     `json:"total_tokens"`
+	Failed             bool      `json:"failed"`
+	StatusCode         int       `json:"status_code"`
+	UpstreamStatusCode int       `json:"upstream_status_code"`
+}
+
+type SessionTreeResult struct {
+	RootSessionID string             `json:"root_session_id"`
+	TotalSessions int                `json:"total_sessions"`
+	TotalRequests int64              `json:"total_requests"`
+	TotalTokens   int64              `json:"total_tokens"`
+	Truncated     bool               `json:"truncated,omitempty"`
+	Tree          []*SessionTreeNode `json:"tree"`
+}
+
+// GetSessionTree retrieves the hierarchical session tree, cumulative metrics, and request timelines for any session, root_session, or request ID.
+func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*SessionTreeResult, error) {
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return nil, errors.New("session identifier is required")
+	}
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, errDB
+	}
+	ctx = contextOrBackground(ctx)
+
+	// Step 1: Look up a sample record from the given identifier to find its parent/root pointers.
+	var sample UsageRecord
+	// Support numeric usage ID, event ID (evt_<id>), request_id, session_id, root_session_id, parent_session_id
+	numericID, _ := strconv.ParseUint(strings.TrimPrefix(identifier, "evt_"), 10, 64)
+	queryScope := db.WithContext(ctx).Table("usage").
+		Select("session_id, parent_session_id, root_session_id")
+	if numericID > 0 {
+		queryScope = queryScope.Where("id = ? OR request_id = ? OR session_id = ? OR root_session_id = ? OR parent_session_id = ?", numericID, identifier, identifier, identifier, identifier)
+	} else {
+		queryScope = queryScope.Where("request_id = ? OR session_id = ? OR root_session_id = ? OR parent_session_id = ?", identifier, identifier, identifier, identifier)
+	}
+	errFind := queryScope.Order("timestamp DESC").Limit(1).Scan(&sample).Error
+	if errFind != nil {
+		return nil, errFind
+	}
+
+	curr := sample.SessionID
+	if curr == "" {
+		curr = identifier
+	}
+	parent := sample.ParentSessionID
+	rootCandidate := sample.RootSessionID
+
+	// Ascend recursively to find the true top-level root (up to MaxSessionTreeAscentHops to prevent cycles).
+	visited := make(map[string]bool)
+	visited[curr] = true
+	trueRootID := curr
+	if rootCandidate != "" && rootCandidate != curr {
+		trueRootID = rootCandidate
+	} else if parent != "" && parent != curr {
+		trueRootID = parent
+	}
+
+	for hops := 0; hops < MaxSessionTreeAscentHops; hops++ {
+		var parentSample UsageRecord
+		errParent := db.WithContext(ctx).Table("usage").
+			Select("session_id, parent_session_id, root_session_id").
+			Where("session_id = ?", trueRootID).
+			Order("timestamp DESC").
+			Limit(1).
+			Scan(&parentSample).Error
+		if errParent != nil || parentSample.SessionID == "" {
+			break
+		}
+		nextCandidate := ""
+		if parentSample.RootSessionID != "" && parentSample.RootSessionID != trueRootID {
+			nextCandidate = parentSample.RootSessionID
+		} else if parentSample.ParentSessionID != "" && parentSample.ParentSessionID != trueRootID {
+			nextCandidate = parentSample.ParentSessionID
+		}
+		if nextCandidate == "" || visited[nextCandidate] {
+			break
+		}
+		visited[nextCandidate] = true
+		trueRootID = nextCandidate
+	}
+
+	// Step 2: Query all records belonging to this family tree (bounded to prevent runaway memory usage).
+	const sessionTreeColumns = "id, timestamp, request_id, session_id, parent_session_id, root_session_id, model, provider, latency_ms, ttft_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, failed, fail_status_code, upstream_status_code"
+	var truncated bool
+
+	var records []UsageRecord
+	errRecords := db.WithContext(ctx).Table("usage").
+		Select(sessionTreeColumns).
+		Where("root_session_id = ? OR session_id = ? OR parent_session_id = ?", trueRootID, trueRootID, trueRootID).
+		Order("timestamp ASC").
+		Limit(MaxSessionTreeRecords + 1).
+		Find(&records).Error
+	if errRecords != nil {
+		return nil, errRecords
+	}
+	if len(records) > MaxSessionTreeRecords {
+		truncated = true
+		records = records[:MaxSessionTreeRecords]
+	}
+
+	loadedRecordIDs := make(map[uint]bool)
+	loadedSessionIDs := make(map[string]bool)
+	for _, rec := range records {
+		loadedRecordIDs[rec.ID] = true
+		if rec.SessionID != "" {
+			loadedSessionIDs[rec.SessionID] = true
+		}
+	}
+
+	// Expand multi-level descendants via BFS (up to MaxSessionTreeBFSDepth levels deep)
+	frontierParents := make([]string, 0, len(loadedSessionIDs))
+	for sess := range loadedSessionIDs {
+		frontierParents = append(frontierParents, sess)
+	}
+
+	for depth := 0; depth < MaxSessionTreeBFSDepth && len(frontierParents) > 0 && !truncated; depth++ {
+		remaining := MaxSessionTreeRecords - len(records)
+		if remaining <= 0 {
+			truncated = true
+			break
+		}
+		var childRecords []UsageRecord
+		// Chunk frontierParents to prevent exceeding SQLite/Postgres parameter limits
+		for i := 0; i < len(frontierParents); i += SessionTreeBFSChunkSize {
+			end := i + SessionTreeBFSChunkSize
+			if end > len(frontierParents) {
+				end = len(frontierParents)
+			}
+			chunk := frontierParents[i:end]
+			chunkLimit := remaining + 1 - len(childRecords)
+			if chunkLimit <= 0 {
+				truncated = true
+				break
+			}
+			var chunkRecords []UsageRecord
+			errChildren := db.WithContext(ctx).Table("usage").
+				Select(sessionTreeColumns).
+				Where("parent_session_id IN (?)", chunk).
+				Order("timestamp ASC").
+				Limit(chunkLimit).
+				Find(&chunkRecords).Error
+			if errChildren != nil {
+				logrus.Warnf("GetSessionTree BFS error loading child sessions at depth %d: %v", depth, errChildren)
+				truncated = true
+				break
+			}
+			childRecords = append(childRecords, chunkRecords...)
+			if len(childRecords) > remaining {
+				truncated = true
+				childRecords = childRecords[:remaining]
+				break
+			}
+		}
+		if len(childRecords) == 0 {
+			break
+		}
+		nextFrontier := make([]string, 0)
+		for _, rec := range childRecords {
+			if !loadedRecordIDs[rec.ID] {
+				loadedRecordIDs[rec.ID] = true
+				records = append(records, rec)
+				if rec.SessionID != "" && !loadedSessionIDs[rec.SessionID] {
+					loadedSessionIDs[rec.SessionID] = true
+					nextFrontier = append(nextFrontier, rec.SessionID)
+				}
+			}
+		}
+		frontierParents = nextFrontier
+		if depth == MaxSessionTreeBFSDepth-1 && len(frontierParents) > 0 {
+			truncated = true
+		}
+	}
+
+	// Step 2.5: Reconcile all turns for all discovered sessions in the tree.
+	// This guarantees that if a session had early turns before its parent link was populated
+	// (e.g. late parent backfill), those turns are 100% retrieved and included in the timeline.
+	if len(loadedSessionIDs) > 0 && !truncated {
+		allSessionIDs := make([]string, 0, len(loadedSessionIDs))
+		for sess := range loadedSessionIDs {
+			allSessionIDs = append(allSessionIDs, sess)
+		}
+		for i := 0; i < len(allSessionIDs); i += SessionTreeBFSChunkSize {
+			end := i + SessionTreeBFSChunkSize
+			if end > len(allSessionIDs) {
+				end = len(allSessionIDs)
+			}
+			chunk := allSessionIDs[i:end]
+			remaining := MaxSessionTreeRecords - len(records)
+			if remaining <= 0 {
+				truncated = true
+				break
+			}
+			var backfillRecords []UsageRecord
+			errBackfill := db.WithContext(ctx).Table("usage").
+				Select(sessionTreeColumns).
+				Where("session_id IN (?)", chunk).
+				Order("timestamp ASC").
+				Limit(remaining + 1).
+				Find(&backfillRecords).Error
+			if errBackfill == nil {
+				for _, rec := range backfillRecords {
+					if !loadedRecordIDs[rec.ID] {
+						loadedRecordIDs[rec.ID] = true
+						records = append(records, rec)
+						if len(records) >= MaxSessionTreeRecords {
+							truncated = true
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(records) == 0 {
+		return &SessionTreeResult{RootSessionID: trueRootID, Tree: []*SessionTreeNode{}}, nil
+	}
+
+	// Sort all records by timestamp ascending for accurate timeline construction,
+	// using record ID as secondary tiebreaker for deterministic ordering.
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].Timestamp.Equal(records[j].Timestamp) {
+			return records[i].ID < records[j].ID
+		}
+		return records[i].Timestamp.Before(records[j].Timestamp)
+	})
+
+	// Step 3: Aggregate metrics and build timelines per session.
+	nodesMap := make(map[string]*SessionTreeNode)
+	turnCounters := make(map[string]int)
+	orderedKeys := make([]string, 0)
+
+	for _, rec := range records {
+		sessID := rec.SessionID
+		if sessID == "" {
+			sessID = trueRootID
+		}
+		node, exists := nodesMap[sessID]
+		if !exists {
+			node = &SessionTreeNode{
+				SessionID:       sessID,
+				ParentSessionID: rec.ParentSessionID,
+				RootSessionID:   trueRootID,
+				FirstSeenAt:     rec.Timestamp.UTC(),
+				LastSeenAt:      rec.Timestamp.UTC(),
+				Children:        make([]*SessionTreeNode, 0),
+				Timeline:        make([]SessionTimelineRequest, 0),
+			}
+			nodesMap[sessID] = node
+			orderedKeys = append(orderedKeys, sessID)
+		} else if node.ParentSessionID == "" && rec.ParentSessionID != "" {
+			node.ParentSessionID = rec.ParentSessionID
+		}
+		turnCounters[sessID]++
+		node.RequestCount++
+		node.TotalLatencyMS += rec.LatencyMS
+		node.InputTokens += rec.InputTokens
+		node.OutputTokens += rec.OutputTokens
+		node.ReasoningTokens += rec.ReasoningTokens
+		node.CachedTokens += rec.CachedTokens
+		node.TotalTokens += rec.TotalTokens
+		if rec.Failed {
+			node.FailedCount++
+		}
+		if rec.Timestamp.After(node.LastSeenAt) {
+			node.LastSeenAt = rec.Timestamp.UTC()
+		}
+		statusCode := 200
+		if rec.Failed {
+			statusCode = rec.FailStatusCode
+		} else if rec.UpstreamStatusCode > 0 {
+			statusCode = rec.UpstreamStatusCode
+		}
+		node.Timeline = append(node.Timeline, SessionTimelineRequest{
+			RequestID:          rec.RequestID,
+			Turn:               turnCounters[sessID],
+			Timestamp:          rec.Timestamp.UTC(),
+			Model:              rec.Model,
+			Provider:           rec.Provider,
+			LatencyMS:          rec.LatencyMS,
+			TTFTMS:             rec.TTFTMS,
+			InputTokens:        rec.InputTokens,
+			OutputTokens:       rec.OutputTokens,
+			ReasoningTokens:    rec.ReasoningTokens,
+			CachedTokens:       rec.CachedTokens,
+			TotalTokens:        rec.TotalTokens,
+			Failed:             rec.Failed,
+			StatusCode:         statusCode,
+			UpstreamStatusCode: rec.UpstreamStatusCode,
+		})
+	}
+
+	// Step 4: Assemble tree nodes into hierarchy with cycle detection.
+	isCycle := func(parentCandidate *SessionTreeNode, targetID string) bool {
+		currNode := parentCandidate
+		visitedNodes := make(map[string]bool)
+		for currNode != nil {
+			if currNode.SessionID == targetID {
+				return true
+			}
+			if visitedNodes[currNode.SessionID] {
+				break
+			}
+			visitedNodes[currNode.SessionID] = true
+			if currNode.ParentSessionID == "" || currNode.ParentSessionID == currNode.SessionID {
+				break
+			}
+			currNode = nodesMap[currNode.ParentSessionID]
+		}
+		return false
+	}
+
+	var roots []*SessionTreeNode
+	var totalRequests, totalTokens int64
+	for _, key := range orderedKeys {
+		node := nodesMap[key]
+		totalRequests += node.RequestCount
+		totalTokens += node.TotalTokens
+		if node.ParentSessionID != "" && node.ParentSessionID != node.SessionID {
+			if parentNode, ok := nodesMap[node.ParentSessionID]; ok {
+				if !isCycle(parentNode, node.SessionID) {
+					parentNode.Children = append(parentNode.Children, node)
+					continue
+				}
+			}
+		}
+		roots = append(roots, node)
+	}
+
+	return &SessionTreeResult{
+		RootSessionID: trueRootID,
+		TotalSessions: len(nodesMap),
+		TotalRequests: totalRequests,
+		TotalTokens:   totalTokens,
+		Truncated:     truncated,
+		Tree:          roots,
+	}, nil
+}

@@ -223,6 +223,7 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodPost, "/quota/collect", handler.CollectQuota)
 	r.Set(http.MethodGet, "/usage/overview", handler.GetUsageOverview)
 	r.Set(http.MethodGet, "/usage/records", handler.ListUsageRecords)
+	r.Set(http.MethodGet, "/usage/session-tree", handler.GetSessionTree)
 	r.Set(http.MethodGet, "/usage/records/:id", handler.GetUsageRecord)
 	r.Set(http.MethodGet, "/usage/aggregates", handler.ListUsageAggregates)
 	r.Set(http.MethodGet, "/usage/export", handler.ExportUsageRecords)

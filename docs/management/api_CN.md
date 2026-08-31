@@ -135,6 +135,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/usage/overview` |
 | `GET` | `/usage/records` |
 | `GET` | `/usage/records/:id` |
+| `GET` | `/usage/session-tree` |
 | `GET` | `/usage/aggregates` |
 | `GET` | `/usage/export` |
 | `GET` | `/usage/realtime` |
@@ -2862,6 +2863,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credential-in-
 | `capabilities.usage_credential_health` | boolean | 是否支持 `GET /usage/health/credentials`。 |
 | `capabilities.usage_realtime` | boolean | 是否支持 `GET /usage/realtime`。 |
 | `capabilities.usage_token_breakdown_v2` | boolean | 是否所有已持久化 usage 行都具备规范化 Token Accounting v2 明细。可恢复的历史回填未完成时保持 `false`。 |
+| `capabilities.usage_session_tree` | boolean | 是否支持 `GET /usage/session-tree` 按需获取多层级会话树与时序时间线。 |
 | `capabilities.request_log_index` | boolean | 是否支持 `GET /request-logs`。 |
 | `capabilities.request_events` / `capabilities.requestEvents` | boolean | 是否支持 `GET /request-events`。 |
 | `capabilities.request_event_details` / `capabilities.requestEventDetails` | boolean | 是否支持 `GET /request-events/:id`。 |
@@ -3115,6 +3117,9 @@ usage 活动归属于通过 `auth_index` 解析出的当前 DB 凭证，因此�
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `upstream_request_id` | string/null | payload 中可解析到的上游 request ID。 |
+| `session_id` | string/null | 该轮对话关联的会话标识。 |
+| `parent_session_id` | string/null | 派生自父级 Agent/任务时的父会话标识。 |
+| `root_session_id` | string/null | 顶层根会话标识，用于跨 Agent/多轮对话全流程贯通。 |
 | `event_type` | string/null | 事件类型，来自 payload 字段或由 endpoint 派生。 |
 | `upstream_status_code` | integer/null | 从结构化 usage 列或 payload 字段解析出的上游状态码。 |
 | `source` | string/null | usage payload 的来源。 |
@@ -3167,6 +3172,7 @@ Query 参数：
 | `status` | string | 无 | `success` 或 `failed`。 |
 | `status_code` | integer | 无 | HTTP/失败状态码；2xx/3xx 会匹配成功请求，其他值匹配 `fail_status_code`。 |
 | `request_id` | string | 无 | request ID 精确筛选。 |
+| `session_id` / `parent_session_id` / `root_session_id` | string | 无 | 精确匹配单轮会话、父任务或顶层根会话 ID。 |
 | `event_type` | string | 无 | 事件类型筛选，常见值为 `completion`、`response`、`message`、`embedding`、`stream`。 |
 | `cpa_node` | string | 无 | 按结构化 CPA node ID、CPA IP、CPA label、CPA port 做模糊筛选。 |
 | `user` / `user_id` | string / integer | 无 | 用户名或用户 ID。 |
@@ -3190,6 +3196,18 @@ Query 参数：
 | `include_logs` | boolean | `false` | 找到本地 request log 时返回最多 20 行脱敏日志片段；远端节点或文件不存在时返回空数组。 |
 
 响应包含 `record`、`payload_summary`、`log_excerpt` 和 `related`。`payload_summary` 只包含 `method`、`stream`、`message_count`、`tool_count`，不会返回原始 payload。`related.request_log` 包含 `request_id`、`home_ip`、`home_port`、`available` 和 `download_url`，本地文件与远端转发的可用性语义与请求事件接口一致。
+
+### GET `/usage/session-tree`
+
+按需获取指定会话、根会话或请求 ID 的多层级会话树（Session Tree）与各分支时序时间线。
+
+Query 参数：
+
+| Query | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `session_id` / `root_session_id` / `request_id` / `id` | string | 无 | 待检索的会话或请求标识。传入子任务、具体请求 ID 或 `id` 别名时会自动解析顶层根会话并返回全量层级树。 |
+
+响应包含 `root_session_id`、`total_sessions`、`total_requests`、`total_tokens` 和 `tree[]`。每个树节点包含该分支的累计 Token 统计、起止时间、报错次数、子分支列表（`children[]`）与请求轮次时间线（`timeline[]`）。
 
 ### GET `/usage/aggregates`
 
@@ -3235,6 +3253,7 @@ Query 参数：
 | `sort` | string | `timestamp_desc` | 支持 `timestamp_desc`、`timestamp_asc`、`latency_desc`、`latency_asc`、`tokens_desc`、`tokens_asc`、`cost_desc`、`cost_asc`、`failed_first`。 |
 | `search` | string | 无 | request ID、provider、model、endpoint、Home IP、username、masked key、credential label 的宽松搜索。 |
 | `request_id` | string | 无 | request ID 精确筛选。 |
+| `session_id` / `parent_session_id` / `root_session_id` | string | 无 | 精确匹配单轮会话、父任务或顶层根会话 ID。 |
 | `event_type` | string | 无 | 事件类型筛选。当前由 payload 中的 `event_type`/`type` 或 endpoint 派生，常见值为 `completion`、`response`、`message`、`embedding`、`stream`。 |
 | `status` / `status_code` | string / integer | 无 | `success`、`failed` 或状态码筛选。 |
 | `provider` / `model` | string | 无 | Provider 精确筛选，model 模糊筛选。 |
@@ -3250,6 +3269,7 @@ Query 参数：
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `id` | string | 稳定事件 ID，格式为 `evt_<usage_id>`。 |
+| `session_id` / `parent_session_id` / `root_session_id` | string/null | 会话层级标识字段，用于追踪多轮对话与子 Agent 链路。 |
 | `event_type` | string | 事件类型，优先来自 payload，缺失时由 endpoint 派生。 |
 | `status` / `failed` / `status_code` / `upstream_status_code` | mixed | 请求成功/失败和 HTTP 状态。成功请求默认 `status_code=200`。 |
 | `provider` / `model` / `original_model` / `model_alias` / `endpoint` | mixed | 模型和路由信息。 |

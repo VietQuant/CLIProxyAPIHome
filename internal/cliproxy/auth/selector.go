@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -422,13 +423,16 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 
 // Pick selects an auth with session affinity when possible.
 // Priority for session ID extraction:
-//  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority
-//  2. X-Session-ID header
-//  3. Session_id header (Codex)
-//  4. X-Client-Request-Id header (PI)
-//  5. metadata.user_id (non-Claude Code format)
-//  6. conversation_id field in request body
-//  7. Stable hash from first few messages content (fallback)
+//  1. Anthropic / Claude Code headers (X-Claude-Code-Session-Id, X-Claude-Code-Agent-Id)
+//  2. Claude Code metadata.user_id in payload (user_xxx_account__session_xxx)
+//  3. OpenAI / Codex CLI headers (Session-Id, Session_id, X-Codex-Parent-Thread-Id)
+//  4. Antigravity CLI headers (X-Http-Session-Id)
+//  5. Explicit session headers (X-Session-ID, X-Session-Affinity, X-Slot-Session-Id)
+//  6. Conversation / Client headers (X-Conversation-Id, X-Thread-Id, X-Client-Request-Id)
+//  7. Body session_id / sessionId (root or nested request)
+//  8. Body metadata.user_id (non-Claude Code format)
+//  9. Body conversation_id
+//  10. Hash-based fallback from message content
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -523,66 +527,333 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	}
 }
 
-// extractSessionIDs returns (primaryID, fallbackID) for session affinity.
-// primaryID: full hash including assistant response (stable after first turn)
-// fallbackID: short hash without assistant (used to inherit binding from first turn)
-func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
-	// 1. metadata.user_id with Claude Code session format (highest priority)
-	if len(payload) > 0 {
-		userID := gjson.GetBytes(payload, "metadata.user_id").String()
-		if userID != "" {
-			// Old format: user_{hash}_account__session_{uuid}
-			if matches := sessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
-				id := "claude:" + matches[1]
-				return id, ""
+// NormalizeExplicitID validates and cleans an explicit session identifier.
+// It trims whitespace, rejects control characters, and rejects IDs exceeding 256 bytes.
+func NormalizeExplicitID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 256 {
+		return ""
+	}
+	for _, r := range raw {
+		if unicode.IsControl(r) {
+			return ""
+		}
+	}
+	return raw
+}
+
+var knownSessionPrefixes = []string{
+	"claude:",
+	"codex:",
+	"header:",
+	"slot:",
+	"affinity:",
+	"agy:",
+	"thread:",
+	"conv:",
+	"user:",
+	"clientreq:",
+	"ctx:",
+	"geminicache:",
+	"session:",
+	"lcp:",
+}
+
+func hasKnownSessionPrefix(id string) bool {
+	for _, prefix := range knownSessionPrefixes {
+		if strings.HasPrefix(id, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func formatSessionID(raw, defaultPrefix string) string {
+	raw = NormalizeExplicitID(raw)
+	if raw == "" {
+		return ""
+	}
+	if hasKnownSessionPrefix(raw) {
+		return raw
+	}
+	return defaultPrefix + raw
+}
+
+func sessionHeaderValue(headers http.Header, names ...string) string {
+	if headers == nil {
+		return ""
+	}
+	for _, name := range names {
+		if val := NormalizeExplicitID(headers.Get(name)); val != "" {
+			return val
+		}
+		for key, values := range headers {
+			if strings.EqualFold(key, name) {
+				for _, v := range values {
+					if trimmed := NormalizeExplicitID(v); trimmed != "" {
+						return trimmed
+					}
+				}
 			}
-			// New format: JSON object with session_id field
-			// e.g. {"device_id":"...","account_uuid":"...","session_id":"uuid"}
-			if len(userID) > 0 && userID[0] == '{' {
-				if sid := gjson.Get(userID, "session_id").String(); sid != "" {
-					return "claude:" + sid, ""
+		}
+	}
+	return ""
+}
+
+// extractSessionIDs returns (primaryID, fallbackID) for session affinity.
+// primaryID: session identity (or full message hash)
+// fallbackID: parent session identity (or short message hash without assistant)
+func extractSessionIDs(headers http.Header, payload []byte, _ map[string]any) (string, string) {
+	// Extract parent candidate from payload once if payload is non-empty
+	var parentCandidate string
+	var parsedRoot gjson.Result
+	var reqRoot gjson.Result
+	hasNestedReq := false
+	if len(payload) > 0 {
+		parsedRoot = gjson.ParseBytes(payload)
+		req := parsedRoot.Get("request")
+		hasNestedReq = req.Exists() && !parsedRoot.Get("contents").Exists()
+		if hasNestedReq {
+			reqRoot = req
+		}
+		for _, parentPath := range []string{
+			"parent_session_id", "parentSessionId",
+			"parent_thread_id", "parentThreadId",
+			"forked_from_thread_id", "forked_from_id",
+			"parent_conversation_id", "parentConversationId",
+			"metadata.parent_session_id", "metadata.parent_thread_id",
+			"extra_body.parent_session_id", "extra_body.parent_thread_id",
+		} {
+			if psid := NormalizeExplicitID(parsedRoot.Get(parentPath).String()); psid != "" {
+				parentCandidate = psid
+				break
+			}
+			if hasNestedReq {
+				if psid := NormalizeExplicitID(reqRoot.Get(parentPath).String()); psid != "" {
+					parentCandidate = psid
+					break
 				}
 			}
 		}
 	}
 
-	// 2. X-Session-ID header
-	if headers != nil {
-		if sid := headers.Get("X-Session-ID"); sid != "" {
-			return "header:" + sid, ""
+	// 1. Anthropic / Claude Code headers
+	if sid := sessionHeaderValue(headers, "X-Claude-Code-Session-Id"); sid != "" {
+		agentID := sessionHeaderValue(headers, "X-Claude-Code-Agent-Id")
+		parentAgentID := sessionHeaderValue(headers, "X-Claude-Code-Parent-Agent-Id")
+		if agentID != "" && agentID != "main" {
+			primary := formatSessionID(sid+":agent:"+agentID, "claude:")
+			fallback := formatSessionID(sid, "claude:")
+			if parentAgentID != "" && parentAgentID != "main" && parentAgentID != agentID {
+				fallback = formatSessionID(sid+":agent:"+parentAgentID, "claude:")
+			} else if parentCandidate != "" && parentCandidate != sid {
+				fallback = formatSessionID(parentCandidate, "claude:")
+			}
+			return primary, fallback
+		}
+		primary := formatSessionID(sid, "claude:")
+		var fallback string
+		if parentCandidate != "" && parentCandidate != sid {
+			fallback = formatSessionID(parentCandidate, "claude:")
+		}
+		return primary, fallback
+	}
+
+	// 2. metadata.user_id with Claude Code session format
+	if len(payload) > 0 {
+		userID := strings.TrimSpace(parsedRoot.Get("metadata.user_id").String())
+		if userID == "" && hasNestedReq {
+			userID = strings.TrimSpace(reqRoot.Get("metadata.user_id").String())
+		}
+		if userID != "" {
+			if len(userID) > 0 && userID[0] == '{' {
+				parsed := gjson.Parse(userID)
+				if sid := NormalizeExplicitID(parsed.Get("session_id").String()); sid != "" {
+					agentID := NormalizeExplicitID(parsed.Get("agent_id").String())
+					parentSID := NormalizeExplicitID(parsed.Get("parent_session_id").String())
+					if parentSID == "" {
+						parentSID = parentCandidate
+					}
+					if agentID != "" && agentID != "main" {
+						primary := formatSessionID(sid+":agent:"+agentID, "claude:")
+						fallback := formatSessionID(sid, "claude:")
+						if parentSID != "" && parentSID != sid {
+							fallback = formatSessionID(parentSID, "claude:")
+						}
+						return primary, fallback
+					}
+					primary := formatSessionID(sid, "claude:")
+					var fallback string
+					if parentSID != "" && parentSID != sid {
+						fallback = formatSessionID(parentSID, "claude:")
+					}
+					return primary, fallback
+				}
+			}
+			if matches := sessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
+				if sid := NormalizeExplicitID(matches[1]); sid != "" {
+					primary := formatSessionID(sid, "claude:")
+					var fallback string
+					if parentCandidate != "" && parentCandidate != sid {
+						fallback = formatSessionID(parentCandidate, "claude:")
+					}
+					return primary, fallback
+				}
+			}
 		}
 	}
 
-	// 3. Session_id header (Codex)
-	if headers != nil {
-		if sid := headers.Get("Session_id"); sid != "" {
-			return "codex:" + sid, ""
+	// 3. Codex Session-Id / Session_id
+	if sid := sessionHeaderValue(headers, "Session-Id", "Session_id"); sid != "" {
+		parentThreadID := sessionHeaderValue(headers, "x-codex-parent-thread-id", "X-Codex-Parent-Thread-Id", "X-Parent-Session-ID", "X-Parent-Session-Id")
+		if parentThreadID == "" {
+			parentThreadID = parentCandidate
 		}
+		primary := formatSessionID(sid, "codex:")
+		var fallback string
+		if parentThreadID != "" && parentThreadID != sid {
+			fallback = formatSessionID(parentThreadID, "codex:")
+		}
+		return primary, fallback
 	}
 
-	// 4. X-Client-Request-Id header (PI)
-	if headers != nil {
-		if rid := headers.Get("X-Client-Request-Id"); rid != "" {
-			return "clientreq:" + rid, ""
+	// 4. Antigravity CLI / Google Cloud Code
+	if sid := sessionHeaderValue(headers, "X-Http-Session-Id"); sid != "" {
+		parentSID := sessionHeaderValue(headers, "X-Parent-Session-ID", "X-Parent-Session-Id")
+		if parentSID == "" {
+			parentSID = parentCandidate
 		}
+		primary := formatSessionID(sid, "agy:")
+		var fallback string
+		if parentSID != "" && parentSID != sid {
+			fallback = formatSessionID(parentSID, "agy:")
+		}
+		return primary, fallback
+	}
+
+	// 5. X-Session-ID (universal header used by CPA Home dispatch and generic clients)
+	if sid := sessionHeaderValue(headers, "X-Session-ID"); sid != "" {
+		parentSID := sessionHeaderValue(headers, "X-Parent-Session-ID", "X-Parent-Session-Id")
+		if parentSID == "" {
+			parentSID = parentCandidate
+		}
+		primary := formatSessionID(sid, "header:")
+		var fallback string
+		if parentSID != "" && parentSID != sid {
+			fallback = formatSessionID(parentSID, "header:")
+		}
+		return primary, fallback
+	}
+
+	// 6. X-Session-Affinity (OpenCode)
+	if sid := sessionHeaderValue(headers, "X-Session-Affinity"); sid != "" {
+		parentAffinity := sessionHeaderValue(headers, "X-Parent-Session-Affinity", "X-Parent-Session-ID", "X-Parent-Session-Id")
+		if parentAffinity == "" {
+			parentAffinity = parentCandidate
+		}
+		primary := formatSessionID(sid, "affinity:")
+		var fallback string
+		if parentAffinity != "" && parentAffinity != sid {
+			fallback = formatSessionID(parentAffinity, "affinity:")
+		}
+		return primary, fallback
+	}
+
+	// 7. X-Slot-Session-Id (Pi Slot)
+	if sid := sessionHeaderValue(headers, "X-Slot-Session-Id"); sid != "" {
+		parentSID := sessionHeaderValue(headers, "X-Parent-Session-ID", "X-Parent-Session-Id")
+		if parentSID == "" {
+			parentSID = parentCandidate
+		}
+		primary := formatSessionID(sid, "slot:")
+		var fallback string
+		if parentSID != "" && parentSID != sid {
+			fallback = formatSessionID(parentSID, "slot:")
+		}
+		return primary, fallback
+	}
+
+	// 8. X-Conversation-Id / X-Thread-Id
+	if sid := sessionHeaderValue(headers, "X-Conversation-Id", "X-Conversation-ID"); sid != "" {
+		parentSID := sessionHeaderValue(headers, "X-Parent-Session-ID", "X-Parent-Session-Id")
+		if parentSID == "" {
+			parentSID = parentCandidate
+		}
+		primary := formatSessionID(sid, "conv:")
+		var fallback string
+		if parentSID != "" && parentSID != sid {
+			fallback = formatSessionID(parentSID, "conv:")
+		}
+		return primary, fallback
+	}
+	if sid := sessionHeaderValue(headers, "X-Thread-Id", "X-Thread-ID", "Thread-Id"); sid != "" {
+		parentSID := sessionHeaderValue(headers, "X-Parent-Session-ID", "X-Parent-Session-Id")
+		if parentSID == "" {
+			parentSID = parentCandidate
+		}
+		primary := formatSessionID(sid, "thread:")
+		var fallback string
+		if parentSID != "" && parentSID != sid {
+			fallback = formatSessionID(parentSID, "thread:")
+		}
+		return primary, fallback
+	}
+
+	// 9. X-Client-Request-Id header (PI)
+	if rid := sessionHeaderValue(headers, "X-Client-Request-Id"); rid != "" {
+		return formatSessionID(rid, "clientreq:"), ""
 	}
 
 	if len(payload) == 0 {
 		return "", ""
 	}
 
-	// 5. metadata.user_id (non-Claude Code format)
-	userID := gjson.GetBytes(payload, "metadata.user_id").String()
-	if userID != "" {
-		return "user:" + userID, ""
+	// 10. explicit session_id / sessionId in payload root
+	for _, path := range []string{"session_id", "sessionId"} {
+		if sid := NormalizeExplicitID(parsedRoot.Get(path).String()); sid != "" {
+			primary := formatSessionID(sid, "header:")
+			var fallback string
+			if parentCandidate != "" && parentCandidate != sid {
+				fallback = formatSessionID(parentCandidate, "header:")
+			}
+			return primary, fallback
+		}
+		if hasNestedReq {
+			if sid := NormalizeExplicitID(reqRoot.Get(path).String()); sid != "" {
+				primary := formatSessionID(sid, "header:")
+				var fallback string
+				if parentCandidate != "" && parentCandidate != sid {
+					fallback = formatSessionID(parentCandidate, "header:")
+				}
+				return primary, fallback
+			}
+		}
 	}
 
-	// 6. conversation_id field
-	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
-		return "conv:" + convID, ""
+	// 11. metadata.user_id (non-Claude Code format)
+	rawUserID := NormalizeExplicitID(parsedRoot.Get("metadata.user_id").String())
+	if rawUserID == "" && hasNestedReq {
+		rawUserID = NormalizeExplicitID(reqRoot.Get("metadata.user_id").String())
+	}
+	if rawUserID != "" {
+		return formatSessionID(rawUserID, "user:"), ""
 	}
 
-	// 7. Hash-based fallback from message content
+	// 12. conversation_id field in payload
+	convID := NormalizeExplicitID(parsedRoot.Get("conversation_id").String())
+	if convID == "" && hasNestedReq {
+		convID = NormalizeExplicitID(reqRoot.Get("conversation_id").String())
+	}
+	if convID != "" {
+		primary := formatSessionID(convID, "conv:")
+		var fallback string
+		if parentCandidate != "" && parentCandidate != convID {
+			fallback = formatSessionID(parentCandidate, "conv:")
+		}
+		return primary, fallback
+	}
+
+	// 13. Hash-based fallback from message content
 	return extractMessageHashIDs(payload)
 }
 

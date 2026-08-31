@@ -169,6 +169,9 @@ func requestEventResponse(record *cluster.UsageObservabilityRecord) gin.H {
 		"id":                   "evt_" + record.ID,
 		"timestamp":            record.Timestamp.UTC().Format(time.RFC3339Nano),
 		"request_id":           record.RequestID,
+		"session_id":           emptyStringAsNil(record.SessionID),
+		"parent_session_id":    emptyStringAsNil(record.ParentSessionID),
+		"root_session_id":      emptyStringAsNil(record.RootSessionID),
 		"upstream_request_id":  emptyStringAsNil(record.UpstreamRequestID),
 		"event_type":           requestEventType(record),
 		"status":               record.Status,
@@ -459,7 +462,7 @@ func nestedMapValuePath(item gin.H, path ...string) any {
 
 func requestEventExportCSVHeader() []string {
 	return []string{
-		"id", "timestamp", "request_id", "upstream_request_id", "event_type", "status", "failed", "status_code", "upstream_status_code",
+		"id", "timestamp", "request_id", "upstream_request_id", "session_id", "parent_session_id", "root_session_id", "event_type", "status", "failed", "status_code", "upstream_status_code",
 		"provider", "model", "original_model", "model_alias", "endpoint", "source", "executor_type", "service_tier", "reasoning_effort",
 		"home_ip", "home_port", "home_id", "cpa_node_id", "cpa_ip", "cpa_port", "cpa_label",
 		"credential_type", "credential_id", "auth_index", "credential_provider", "credential_label", "credential_source", "credential_api_key_preview",
