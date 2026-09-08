@@ -4202,6 +4202,16 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 				end = len(frontierParents)
 			}
 			chunk := frontierParents[i:end]
+			expandedChunk := make([]string, 0, len(chunk)*2)
+			seenChunk := make(map[string]bool)
+			for _, p := range chunk {
+				for _, cand := range SessionQueryCandidates(p) {
+					if cand != "" && !seenChunk[cand] {
+						seenChunk[cand] = true
+						expandedChunk = append(expandedChunk, cand)
+					}
+				}
+			}
 			chunkLimit := remaining + 1 - len(childRecords)
 			if chunkLimit <= 0 {
 				truncated = true
@@ -4210,7 +4220,7 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 			var chunkRecords []UsageRecord
 			errChildren := db.WithContext(ctx).Table("usage").
 				Select(sessionTreeColumns).
-				Where("parent_session_id IN (?)", chunk).
+				Where("parent_session_id IN (?)", expandedChunk).
 				Order("timestamp ASC").
 				Limit(chunkLimit).
 				Find(&chunkRecords).Error
@@ -4260,6 +4270,16 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 				end = len(allSessionIDs)
 			}
 			chunk := allSessionIDs[i:end]
+			expandedChunk := make([]string, 0, len(chunk)*2)
+			seenChunk := make(map[string]bool)
+			for _, s := range chunk {
+				for _, cand := range SessionQueryCandidates(s) {
+					if cand != "" && !seenChunk[cand] {
+						seenChunk[cand] = true
+						expandedChunk = append(expandedChunk, cand)
+					}
+				}
+			}
 			remaining := MaxSessionTreeRecords - len(records)
 			if remaining <= 0 {
 				truncated = true
@@ -4268,7 +4288,7 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 			var backfillRecords []UsageRecord
 			errBackfill := db.WithContext(ctx).Table("usage").
 				Select(sessionTreeColumns).
-				Where("session_id IN (?)", chunk).
+				Where("session_id IN (?)", expandedChunk).
 				Order("timestamp ASC").
 				Limit(remaining + 1).
 				Find(&backfillRecords).Error

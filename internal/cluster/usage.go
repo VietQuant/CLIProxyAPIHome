@@ -455,6 +455,9 @@ func (r *Repository) resolveRootSessionID(ctx context.Context, db *gorm.DB, sess
 		if err != nil || parentRec.SessionID == "" {
 			break
 		}
+		if parentRec.SessionID != "" {
+			curr = parentRec.SessionID
+		}
 		if parentRec.RootSessionID != "" && parentRec.RootSessionID != curr && !visited[parentRec.RootSessionID] {
 			curr = parentRec.RootSessionID
 			break

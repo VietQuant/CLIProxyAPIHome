@@ -38,12 +38,13 @@ func TestNormalizeToCanonicalUUID(t *testing.T) {
 
 	// 4. Known prefixes with UUIDs
 	prefixedCases := map[string]string{
-		"codex:01a07e72-c84d-7fd3-8207-d217b41cc649":         "01a07e72-c84d-7fd3-8207-d217b41cc649",
-		"claude:b2839f64-668d-4dc3-a42a-64da829d1e33":        "b2839f64-668d-4dc3-a42a-64da829d1e33",
-		"header:7a8b9c0d-1111-2222-3333-444455556666":        "7a8b9c0d-1111-2222-3333-444455556666",
-		"session:b2839f64-668d-4dc3-a42a-64da829d1e33":       "b2839f64-668d-4dc3-a42a-64da829d1e33",
-		"thread:01a07e72-c84d-7fd3-8207-d217b41cc649":        "01a07e72-c84d-7fd3-8207-d217b41cc649",
-		"custom-prefix:01a07e72-c84d-7fd3-8207-d217b41cc649": "01a07e72-c84d-7fd3-8207-d217b41cc649",
+		"codex:01a07e72-c84d-7fd3-8207-d217b41cc649":          "01a07e72-c84d-7fd3-8207-d217b41cc649",
+		"claude:b2839f64-668d-4dc3-a42a-64da829d1e33":         "b2839f64-668d-4dc3-a42a-64da829d1e33",
+		"header:7a8b9c0d-1111-2222-3333-444455556666":         "7a8b9c0d-1111-2222-3333-444455556666",
+		"session:b2839f64-668d-4dc3-a42a-64da829d1e33":        "b2839f64-668d-4dc3-a42a-64da829d1e33",
+		"thread:01a07e72-c84d-7fd3-8207-d217b41cc649":         "01a07e72-c84d-7fd3-8207-d217b41cc649",
+		"custom-prefix:01a07e72-c84d-7fd3-8207-d217b41cc649":  "01a07e72-c84d-7fd3-8207-d217b41cc649",
+		"k8s:pod-worker:01a07e72-c84d-7fd3-8207-d217b41cc649": "01a07e72-c84d-7fd3-8207-d217b41cc649",
 	}
 	for input, want := range prefixedCases {
 		got := NormalizeToCanonicalUUID(input)

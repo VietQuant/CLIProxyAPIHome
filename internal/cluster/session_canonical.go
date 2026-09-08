@@ -65,8 +65,8 @@ func NormalizeToCanonicalUUID(rawID string) string {
 		return strings.ToLower(clean)
 	}
 
-	// 3. Check if any generic prefix "prefix:<uuid>" exists
-	if idx := strings.Index(clean, ":"); idx > 0 {
+	// 3. Check if any generic prefix "prefix:<uuid>" exists (using LastIndex to unwrap nested namespaces)
+	if idx := strings.LastIndex(clean, ":"); idx > 0 {
 		candidate := strings.TrimSpace(clean[idx+1:])
 		if canonicalUUIDPattern.MatchString(candidate) {
 			return strings.ToLower(candidate)
