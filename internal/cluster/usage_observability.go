@@ -2335,14 +2335,31 @@ func usageObservabilityApplyRecordFilters(scope *gorm.DB, query UsageObservabili
 	if requestID := strings.TrimSpace(query.RequestID); requestID != "" {
 		scope = scope.Where(`"usage"."request_id" = ?`, requestID)
 	}
+	// Legacy compatibility: match against both raw identifiers and canonical UUIDv8 projections.
+	// TODO(session-cleanup): Revert to strict single-key matching once legacy raw session rows are phased out.
 	if sessionID := strings.TrimSpace(query.SessionID); sessionID != "" {
-		scope = scope.Where(`"usage"."session_id" = ?`, sessionID)
+		candidates := SessionQueryCandidates(sessionID)
+		if len(candidates) > 1 {
+			scope = scope.Where(`"usage"."session_id" IN (?)`, candidates)
+		} else {
+			scope = scope.Where(`"usage"."session_id" = ?`, sessionID)
+		}
 	}
 	if parentSessionID := strings.TrimSpace(query.ParentSessionID); parentSessionID != "" {
-		scope = scope.Where(`"usage"."parent_session_id" = ?`, parentSessionID)
+		candidates := SessionQueryCandidates(parentSessionID)
+		if len(candidates) > 1 {
+			scope = scope.Where(`"usage"."parent_session_id" IN (?)`, candidates)
+		} else {
+			scope = scope.Where(`"usage"."parent_session_id" = ?`, parentSessionID)
+		}
 	}
 	if rootSessionID := strings.TrimSpace(query.RootSessionID); rootSessionID != "" {
-		scope = scope.Where(`"usage"."root_session_id" = ?`, rootSessionID)
+		candidates := SessionQueryCandidates(rootSessionID)
+		if len(candidates) > 1 {
+			scope = scope.Where(`"usage"."root_session_id" IN (?)`, candidates)
+		} else {
+			scope = scope.Where(`"usage"."root_session_id" = ?`, rootSessionID)
+		}
 	}
 	if user := strings.TrimSpace(query.User); user != "" {
 		matcher := "%" + user + "%"
@@ -2441,14 +2458,31 @@ func usageObservabilityApplyUsageFilters(scope *gorm.DB, query UsageObservabilit
 	if requestID := strings.TrimSpace(query.RequestID); requestID != "" {
 		scope = scope.Where(`"usage"."request_id" = ?`, requestID)
 	}
+	// Legacy compatibility: match against both raw identifiers and canonical UUIDv8 projections.
+	// TODO(session-cleanup): Revert to strict single-key matching once legacy raw session rows are phased out.
 	if sessionID := strings.TrimSpace(query.SessionID); sessionID != "" {
-		scope = scope.Where(`"usage"."session_id" = ?`, sessionID)
+		candidates := SessionQueryCandidates(sessionID)
+		if len(candidates) > 1 {
+			scope = scope.Where(`"usage"."session_id" IN (?)`, candidates)
+		} else {
+			scope = scope.Where(`"usage"."session_id" = ?`, sessionID)
+		}
 	}
 	if parentSessionID := strings.TrimSpace(query.ParentSessionID); parentSessionID != "" {
-		scope = scope.Where(`"usage"."parent_session_id" = ?`, parentSessionID)
+		candidates := SessionQueryCandidates(parentSessionID)
+		if len(candidates) > 1 {
+			scope = scope.Where(`"usage"."parent_session_id" IN (?)`, candidates)
+		} else {
+			scope = scope.Where(`"usage"."parent_session_id" = ?`, parentSessionID)
+		}
 	}
 	if rootSessionID := strings.TrimSpace(query.RootSessionID); rootSessionID != "" {
-		scope = scope.Where(`"usage"."root_session_id" = ?`, rootSessionID)
+		candidates := SessionQueryCandidates(rootSessionID)
+		if len(candidates) > 1 {
+			scope = scope.Where(`"usage"."root_session_id" IN (?)`, candidates)
+		} else {
+			scope = scope.Where(`"usage"."root_session_id" = ?`, rootSessionID)
+		}
 	}
 	if executorType := strings.TrimSpace(query.ExecutorType); executorType != "" {
 		scope = scope.Where(`"usage"."executor_type" = ?`, executorType)
@@ -4047,10 +4081,11 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 	numericID, _ := strconv.ParseUint(strings.TrimPrefix(identifier, "evt_"), 10, 64)
 	queryScope := db.WithContext(ctx).Table("usage").
 		Select("session_id, parent_session_id, root_session_id")
+	candidates := SessionQueryCandidates(identifier)
 	if numericID > 0 {
-		queryScope = queryScope.Where("id = ? OR request_id = ? OR session_id = ? OR root_session_id = ? OR parent_session_id = ?", numericID, identifier, identifier, identifier, identifier)
+		queryScope = queryScope.Where("id = ? OR request_id = ? OR session_id IN (?) OR root_session_id IN (?) OR parent_session_id IN (?)", numericID, identifier, candidates, candidates, candidates)
 	} else {
-		queryScope = queryScope.Where("request_id = ? OR session_id = ? OR root_session_id = ? OR parent_session_id = ?", identifier, identifier, identifier, identifier)
+		queryScope = queryScope.Where("request_id = ? OR session_id IN (?) OR root_session_id IN (?) OR parent_session_id IN (?)", identifier, candidates, candidates, candidates)
 	}
 	errFind := queryScope.Order("timestamp DESC").Limit(1).Scan(&sample).Error
 	if errFind != nil {
@@ -4059,7 +4094,11 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 
 	curr := sample.SessionID
 	if curr == "" {
-		curr = identifier
+		if canonical := NormalizeToCanonicalUUID(identifier); canonical != "" {
+			curr = canonical
+		} else {
+			curr = identifier
+		}
 	}
 	parent := sample.ParentSessionID
 	rootCandidate := sample.RootSessionID
@@ -4076,14 +4115,18 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 
 	for hops := 0; hops < MaxSessionTreeAscentHops; hops++ {
 		var parentSample UsageRecord
+		parentCandidates := SessionQueryCandidates(trueRootID)
 		errParent := db.WithContext(ctx).Table("usage").
 			Select("session_id, parent_session_id, root_session_id").
-			Where("session_id = ?", trueRootID).
+			Where("session_id IN (?)", parentCandidates).
 			Order("timestamp DESC").
 			Limit(1).
 			Scan(&parentSample).Error
 		if errParent != nil || parentSample.SessionID == "" {
 			break
+		}
+		if parentSample.SessionID != "" {
+			trueRootID = parentSample.SessionID
 		}
 		nextCandidate := ""
 		if parentSample.RootSessionID != "" && parentSample.RootSessionID != trueRootID {
@@ -4103,9 +4146,22 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 	var truncated bool
 
 	var records []UsageRecord
+	familyCandidates := SessionQueryCandidates(trueRootID)
+	if idCandidates := SessionQueryCandidates(identifier); len(idCandidates) > 0 {
+		seenCand := make(map[string]bool)
+		for _, c := range familyCandidates {
+			seenCand[c] = true
+		}
+		for _, cand := range idCandidates {
+			if cand != "" && !seenCand[cand] {
+				seenCand[cand] = true
+				familyCandidates = append(familyCandidates, cand)
+			}
+		}
+	}
 	errRecords := db.WithContext(ctx).Table("usage").
 		Select(sessionTreeColumns).
-		Where("root_session_id = ? OR session_id = ? OR parent_session_id = ?", trueRootID, trueRootID, trueRootID).
+		Where("root_session_id IN (?) OR session_id IN (?) OR parent_session_id IN (?)", familyCandidates, familyCandidates, familyCandidates).
 		Order("timestamp ASC").
 		Limit(MaxSessionTreeRecords + 1).
 		Find(&records).Error
@@ -4309,7 +4365,31 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 		})
 	}
 
-	// Step 4: Assemble tree nodes into hierarchy with cycle detection.
+	// Step 4: Assemble tree nodes into hierarchy with cycle detection and canonical fallback lookup.
+	// Legacy compatibility: canonicalNodesMap and lookupParentNode provide transitional fallback
+	// resolution for cross-version hybrid sessions where a parent record was persisted with a legacy
+	// raw identifier and a child record references it via modern canonical UUIDv8 (or vice versa).
+	// TODO(session-cleanup): Deprecate and remove canonicalNodesMap once all historical database
+	// records are migrated to canonical UUIDv8.
+	canonicalNodesMap := make(map[string]*SessionTreeNode)
+	for _, node := range nodesMap {
+		if canonical := NormalizeToCanonicalUUID(node.SessionID); canonical != "" {
+			canonicalNodesMap[canonical] = node
+		}
+	}
+
+	lookupParentNode := func(parentID string) *SessionTreeNode {
+		if p, ok := nodesMap[parentID]; ok {
+			return p
+		}
+		if canonical := NormalizeToCanonicalUUID(parentID); canonical != "" {
+			if p, ok := canonicalNodesMap[canonical]; ok {
+				return p
+			}
+		}
+		return nil
+	}
+
 	isCycle := func(parentCandidate *SessionTreeNode, targetID string) bool {
 		currNode := parentCandidate
 		visitedNodes := make(map[string]bool)
@@ -4324,7 +4404,7 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 			if currNode.ParentSessionID == "" || currNode.ParentSessionID == currNode.SessionID {
 				break
 			}
-			currNode = nodesMap[currNode.ParentSessionID]
+			currNode = lookupParentNode(currNode.ParentSessionID)
 		}
 		return false
 	}
@@ -4336,7 +4416,7 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 		totalRequests += node.RequestCount
 		totalTokens += node.TotalTokens
 		if node.ParentSessionID != "" && node.ParentSessionID != node.SessionID {
-			if parentNode, ok := nodesMap[node.ParentSessionID]; ok {
+			if parentNode := lookupParentNode(node.ParentSessionID); parentNode != nil {
 				if !isCycle(parentNode, node.SessionID) {
 					parentNode.Children = append(parentNode.Children, node)
 					continue

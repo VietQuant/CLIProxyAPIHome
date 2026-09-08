@@ -443,9 +443,12 @@ func (r *Repository) resolveRootSessionID(ctx context.Context, db *gorm.DB, sess
 		}
 
 		var parentRec UsageRecord
+		// Legacy compatibility: currCandidates enables parent link traversal across legacy and canonical records.
+		// TODO(session-cleanup): Revert to single-key matching once legacy session records are phased out.
+		currCandidates := SessionQueryCandidates(curr)
 		err := db.WithContext(ctx).Table("usage").
 			Select("session_id, parent_session_id, root_session_id").
-			Where("session_id = ?", curr).
+			Where("session_id IN (?)", currCandidates).
 			Order("timestamp DESC").
 			Limit(1).
 			Scan(&parentRec).Error

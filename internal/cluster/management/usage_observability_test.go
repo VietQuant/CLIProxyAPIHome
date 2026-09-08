@@ -2071,3 +2071,136 @@ func TestGetSessionTreeQueryByParentOnly(t *testing.T) {
 		t.Fatalf("TotalSessions = %d, want 1", res.TotalSessions)
 	}
 }
+
+func TestSessionTreeAndListToleranceForNonUUIDAndPrefixedInput(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+
+	ctx := context.Background()
+	runtime := cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}
+
+	// 1. Non-UUID human-readable task projected to UUIDv8 as stored by modern CPA
+	rootRawTask := "slot:pi-worker-subagent"
+	rootUUIDv8 := cluster.NormalizeToCanonicalUUID(rootRawTask)
+	childRawTask := "slot:pi-leaf-task"
+	childUUIDv8 := cluster.NormalizeToCanonicalUUID(childRawTask)
+
+	pRoot := fmt.Sprintf(`{"timestamp":"2026-08-31T10:00:00Z","request_id":"req-v8-root","session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, rootUUIDv8)
+	pChild := fmt.Sprintf(`{"timestamp":"2026-08-31T10:01:00Z","request_id":"req-v8-child","session_id":"%s","parent_session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, childUUIDv8, rootUUIDv8)
+
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, pRoot, runtime); err != nil {
+		t.Fatalf("AppendUsage root: %v", err)
+	}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, pChild, runtime); err != nil {
+		t.Fatalf("AppendUsage child: %v", err)
+	}
+
+	// 2. Native UUID stored without prefix
+	cleanUUID := "01a07e72-c84d-7fd3-8207-d217b41cc649"
+	pClean := fmt.Sprintf(`{"timestamp":"2026-08-31T10:02:00Z","request_id":"req-clean-uuid","session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, cleanUUID)
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, pClean, runtime); err != nil {
+		t.Fatalf("AppendUsage clean UUID: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/usage/session-tree", handler.GetSessionTree)
+	engine.GET("/request-events", handler.ListRequestEvents)
+
+	// Test A: Query /usage/session-tree using human-readable raw task identifier
+	{
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?id="+rootRawTask, nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("session-tree status = %d body = %s", resp.Code, resp.Body.String())
+		}
+		var res cluster.SessionTreeResult
+		if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal SessionTreeResult: %v", err)
+		}
+		if res.RootSessionID != rootUUIDv8 {
+			t.Fatalf("RootSessionID = %q, want %q", res.RootSessionID, rootUUIDv8)
+		}
+		if res.TotalSessions != 2 {
+			t.Fatalf("TotalSessions = %d, want 2 (root + child)", res.TotalSessions)
+		}
+	}
+
+	// Test B: Query /usage/session-tree using prefixed native UUID (codex:...)
+	{
+		prefixed := "codex:" + cleanUUID
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?id="+prefixed, nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("session-tree with prefixed UUID status = %d body = %s", resp.Code, resp.Body.String())
+		}
+		var res cluster.SessionTreeResult
+		if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal SessionTreeResult: %v", err)
+		}
+		if res.RootSessionID != cleanUUID {
+			t.Fatalf("RootSessionID = %q, want %q", res.RootSessionID, cleanUUID)
+		}
+		if res.TotalSessions != 1 {
+			t.Fatalf("TotalSessions = %d, want 1", res.TotalSessions)
+		}
+	}
+
+	// Test C: Filter /request-events by raw session_id
+	{
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/request-events?session_id="+rootRawTask, nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("request-events status = %d body = %s", resp.Code, resp.Body.String())
+		}
+		var listRes map[string]any
+		if err := json.Unmarshal(resp.Body.Bytes(), &listRes); err != nil {
+			t.Fatalf("unmarshal list response: %v", err)
+		}
+		items, _ := listRes["items"].([]any)
+		if len(items) != 1 {
+			t.Fatalf("items count = %d, want 1 for raw task tolerance", len(items))
+		}
+		firstRec := items[0].(map[string]any)
+		if firstRec["session_id"] != rootUUIDv8 {
+			t.Fatalf("session_id in record = %v, want %s", firstRec["session_id"], rootUUIDv8)
+		}
+	}
+
+	// Test D: Cross-version hybrid tree assembly (legacy parent raw session_id + modern child canonical UUIDv8 parent_session_id)
+	{
+		legacyParentID := "legacy-mixed-root-task"
+		canonicalParentUUID := cluster.NormalizeToCanonicalUUID(legacyParentID)
+		modernChildID := "modern-child-node"
+
+		pLegacyParent := fmt.Sprintf(`{"timestamp":"2026-08-31T11:00:00Z","request_id":"req-hybrid-parent","session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, legacyParentID)
+		pModernChild := fmt.Sprintf(`{"timestamp":"2026-08-31T11:01:00Z","request_id":"req-hybrid-child","session_id":"%s","parent_session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, modernChildID, canonicalParentUUID)
+
+		if _, err := handler.repo.AppendUsageWithRuntime(ctx, pLegacyParent, runtime); err != nil {
+			t.Fatalf("AppendUsage legacy parent: %v", err)
+		}
+		if _, err := handler.repo.AppendUsageWithRuntime(ctx, pModernChild, runtime); err != nil {
+			t.Fatalf("AppendUsage modern child: %v", err)
+		}
+
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?id="+legacyParentID, nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("hybrid session-tree status = %d body = %s", resp.Code, resp.Body.String())
+		}
+		var res cluster.SessionTreeResult
+		if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal SessionTreeResult: %v", err)
+		}
+		if len(res.Tree) != 1 {
+			t.Fatalf("len(res.Tree) = %d, want 1 (child should be nested under parent via canonical lookup)", len(res.Tree))
+		}
+		if len(res.Tree[0].Children) != 1 || res.Tree[0].Children[0].SessionID != modernChildID {
+			t.Fatalf("child node failed to nest under legacy parent, got %#v", res.Tree[0].Children)
+		}
+	}
+}

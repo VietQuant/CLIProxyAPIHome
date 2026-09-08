@@ -3172,7 +3172,7 @@ Query 参数：
 | `status` | string | 无 | `success` 或 `failed`。 |
 | `status_code` | integer | 无 | HTTP/失败状态码；2xx/3xx 会匹配成功请求，其他值匹配 `fail_status_code`。 |
 | `request_id` | string | 无 | request ID 精确筛选。 |
-| `session_id` / `parent_session_id` / `root_session_id` | string | 无 | 精确匹配单轮会话、父任务或顶层根会话 ID。 |
+| `session_id` / `parent_session_id` / `root_session_id` | string | 无 | 会话层级筛选（支持原始会话名与确定性规范化 canonical UUIDv8 双向容错匹配）。 |
 | `event_type` | string | 无 | 事件类型筛选，常见值为 `completion`、`response`、`message`、`embedding`、`stream`。 |
 | `cpa_node` | string | 无 | 按结构化 CPA node ID、CPA IP、CPA label、CPA port 做模糊筛选。 |
 | `user` / `user_id` | string / integer | 无 | 用户名或用户 ID。 |
@@ -3205,7 +3205,7 @@ Query 参数：
 
 | Query | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `session_id` / `root_session_id` / `request_id` / `id` | string | 无 | 待检索的会话或请求标识。传入子任务、具体请求 ID 或 `id` 别名时会自动解析顶层根会话并返回全量层级树。 |
+| `session_id` / `root_session_id` / `request_id` / `id` | string | 无 | 待检索的会话或请求标识（支持原始名称、带前缀标识或规范化 UUIDv8）。传入子任务、具体请求 ID 或 `id` 别名时会自动解析顶层根会话并返回全量层级树。 |
 
 响应包含 `root_session_id`、`total_sessions`、`total_requests`、`total_tokens` 和 `tree[]`。每个树节点包含该分支的累计 Token 统计、起止时间、报错次数、子分支列表（`children[]`）与请求轮次时间线（`timeline[]`）。
 
@@ -3253,7 +3253,7 @@ Query 参数：
 | `sort` | string | `timestamp_desc` | 支持 `timestamp_desc`、`timestamp_asc`、`latency_desc`、`latency_asc`、`tokens_desc`、`tokens_asc`、`cost_desc`、`cost_asc`、`failed_first`。 |
 | `search` | string | 无 | request ID、provider、model、endpoint、Home IP、username、masked key、credential label 的宽松搜索。 |
 | `request_id` | string | 无 | request ID 精确筛选。 |
-| `session_id` / `parent_session_id` / `root_session_id` | string | 无 | 精确匹配单轮会话、父任务或顶层根会话 ID。 |
+| `session_id` / `parent_session_id` / `root_session_id` | string | 无 | 会话层级筛选（支持原始会话名与确定性规范化 canonical UUIDv8 双向容错匹配）。 |
 | `event_type` | string | 无 | 事件类型筛选。当前由 payload 中的 `event_type`/`type` 或 endpoint 派生，常见值为 `completion`、`response`、`message`、`embedding`、`stream`。 |
 | `status` / `status_code` | string / integer | 无 | `success`、`failed` 或状态码筛选。 |
 | `provider` / `model` | string | 无 | Provider 精确筛选，model 模糊筛选。 |

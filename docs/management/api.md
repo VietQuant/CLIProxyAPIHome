@@ -3204,7 +3204,7 @@ Query parameters:
 | `status` | string | none | `success` or `failed`. |
 | `status_code` | integer | none | HTTP/failure status code. 2xx/3xx values match successful requests; other values match `fail_status_code`. |
 | `request_id` | string | none | Exact request ID filter. |
-| `session_id` / `parent_session_id` / `root_session_id` | string | none | Exact session hierarchy filter for turn, parent task, or root workflow. |
+| `session_id` / `parent_session_id` / `root_session_id` | string | none | Session hierarchy filter for turn, parent task, or root workflow. Matches both raw identifiers and canonical UUIDv8 projections. |
 | `event_type` | string | none | Normalized event type filter. Common values include `completion`, `response`, `message`, `embedding`, and `stream`. |
 | `cpa_node` | string | none | Fuzzy filter across structured CPA node ID, CPA IP, CPA label, and CPA port. |
 | `user` / `user_id` | string / integer | none | Username or user ID. |
@@ -3237,7 +3237,7 @@ Query parameters:
 
 | Query | Type | Default | Description |
 | --- | --- | --- | --- |
-| `session_id` / `root_session_id` / `request_id` / `id` | string | none | The identifier to look up. If a `request_id`, `id`, or subagent `session_id` is supplied, the endpoint resolves the root session and returns the full hierarchy. |
+| `session_id` / `root_session_id` / `request_id` / `id` | string | none | The identifier to look up (supports raw names, prefixed IDs, or canonical UUIDv8). If a `request_id`, `id`, or subagent `session_id` is supplied, the endpoint resolves the root session and returns the full hierarchy. |
 
 The response contains `root_session_id`, `total_sessions`, `total_requests`, `total_tokens`, and `tree[]`. Each tree node includes aggregated token metrics, first/last seen timestamps, failure counts, child sessions (`children[]`), and request turns (`timeline[]`).
 
@@ -3285,7 +3285,7 @@ Query parameters:
 | `sort` | string | `timestamp_desc` | Supports `timestamp_desc`, `timestamp_asc`, `latency_desc`, `latency_asc`, `tokens_desc`, `tokens_asc`, `cost_desc`, `cost_asc`, and `failed_first`. |
 | `search` | string | none | Fuzzy search across request ID, provider, model, endpoint, Home IP, CPA node ID/IP/label, username, masked key, and credential label. |
 | `request_id` | string | none | Exact request ID filter. |
-| `session_id` / `parent_session_id` / `root_session_id` | string | none | Exact session hierarchy filter for turn, parent task, or root workflow. |
+| `session_id` / `parent_session_id` / `root_session_id` | string | none | Session hierarchy filter for turn, parent task, or root workflow. Matches both raw identifiers and canonical UUIDv8 projections. |
 | `event_type` | string | none | Event type filter. The value is parsed from `event_type`/`type` payload fields or derived from the endpoint. Common values are `completion`, `response`, `message`, `embedding`, and `stream`. |
 | `status` / `status_code` | string / integer | none | `success`, `failed`, or status code filter. |
 | `provider` / `model` | string | none | Exact provider filter and fuzzy model filter. |
