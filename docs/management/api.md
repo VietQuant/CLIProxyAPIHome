@@ -135,6 +135,7 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/usage/overview` |
 | `GET` | `/usage/records` |
 | `GET` | `/usage/records/:id` |
+| `GET` | `/usage/session-tree` |
 | `GET` | `/usage/aggregates` |
 | `GET` | `/usage/export` |
 | `GET` | `/usage/realtime` |
@@ -2864,6 +2865,7 @@ Response fields:
 | `capabilities.usage_credential_health` | boolean | Whether `GET /usage/health/credentials` is available. |
 | `capabilities.usage_realtime` | boolean | Whether `GET /usage/realtime` is available. |
 | `capabilities.usage_token_breakdown_v2` | boolean | Whether every persisted usage row has the canonical token-accounting v2 breakdown. It remains `false` while the resumable historical backfill is pending. |
+| `capabilities.usage_session_tree` | boolean | Whether `GET /usage/session-tree` on-demand session hierarchy and timeline retrieval is available. |
 | `capabilities.request_log_index` | boolean | Whether `GET /request-logs` is available. |
 | `capabilities.request_events` / `capabilities.requestEvents` | boolean | Whether `GET /request-events` is available. |
 | `capabilities.request_event_details` / `capabilities.requestEventDetails` | boolean | Whether `GET /request-events/:id` is available. |
@@ -3147,6 +3149,9 @@ Key `UsageRecordSummary` fields:
 | Field | Type | Description |
 | --- | --- | --- |
 | `upstream_request_id` | string/null | Upstream request ID parsed from the payload. |
+| `session_id` | string/null | Session identifier associated with this turn. |
+| `parent_session_id` | string/null | Parent session identifier for subagent/fork delegations. |
+| `root_session_id` | string/null | Root session identifier representing the entire conversation or agent tree. |
 | `event_type` | string/null | Normalized event type, parsed from payload fields or derived from the endpoint. |
 | `upstream_status_code` | integer/null | Upstream status code parsed from structured usage columns or payload fields. |
 | `source` | string/null | Usage payload source. |
@@ -3199,6 +3204,7 @@ Query parameters:
 | `status` | string | none | `success` or `failed`. |
 | `status_code` | integer | none | HTTP/failure status code. 2xx/3xx values match successful requests; other values match `fail_status_code`. |
 | `request_id` | string | none | Exact request ID filter. |
+| `session_id` / `parent_session_id` / `root_session_id` | string | none | Session hierarchy filter for turn, parent task, or root workflow. Matches both raw identifiers and canonical UUIDv8 projections. |
 | `event_type` | string | none | Normalized event type filter. Common values include `completion`, `response`, `message`, `embedding`, and `stream`. |
 | `cpa_node` | string | none | Fuzzy filter across structured CPA node ID, CPA IP, CPA label, and CPA port. |
 | `user` / `user_id` | string / integer | none | Username or user ID. |
@@ -3222,6 +3228,18 @@ Query parameters:
 | `include_logs` | boolean | `false` | Return up to 20 redacted log lines when a local request log is found. Remote nodes or missing files return an empty array. |
 
 The response contains `record`, `payload_summary`, `log_excerpt`, and `related`. `payload_summary` only contains `method`, `stream`, `message_count`, and `tool_count`; raw payloads are never returned. `related.request_log` contains `request_id`, `home_ip`, `home_port`, `available`, and `download_url` with the same local-file and remote-forwarding availability semantics as the request event APIs.
+
+### GET `/usage/session-tree`
+
+Returns the hierarchical session tree and request timelines on demand for a given session, root session, or request ID.
+
+Query parameters:
+
+| Query | Type | Default | Description |
+| --- | --- | --- | --- |
+| `session_id` / `root_session_id` / `request_id` / `id` | string | none | The identifier to look up (supports raw names, prefixed IDs, or canonical UUIDv8). If a `request_id`, `id`, or subagent `session_id` is supplied, the endpoint resolves the root session and returns the full hierarchy. |
+
+The response contains `root_session_id`, `total_sessions`, `total_requests`, `total_tokens`, and `tree[]`. Each tree node includes aggregated token metrics, first/last seen timestamps, failure counts, child sessions (`children[]`), and request turns (`timeline[]`).
 
 ### GET `/usage/aggregates`
 
@@ -3267,6 +3285,7 @@ Query parameters:
 | `sort` | string | `timestamp_desc` | Supports `timestamp_desc`, `timestamp_asc`, `latency_desc`, `latency_asc`, `tokens_desc`, `tokens_asc`, `cost_desc`, `cost_asc`, and `failed_first`. |
 | `search` | string | none | Fuzzy search across request ID, provider, model, endpoint, Home IP, CPA node ID/IP/label, username, masked key, and credential label. |
 | `request_id` | string | none | Exact request ID filter. |
+| `session_id` / `parent_session_id` / `root_session_id` | string | none | Session hierarchy filter for turn, parent task, or root workflow. Matches both raw identifiers and canonical UUIDv8 projections. |
 | `event_type` | string | none | Event type filter. The value is parsed from `event_type`/`type` payload fields or derived from the endpoint. Common values are `completion`, `response`, `message`, `embedding`, and `stream`. |
 | `status` / `status_code` | string / integer | none | `success`, `failed`, or status code filter. |
 | `provider` / `model` | string | none | Exact provider filter and fuzzy model filter. |
@@ -3282,6 +3301,7 @@ The response contains `items`, `total`, `limit`, `offset`, and `sort`. `items[]`
 | Field | Type | Description |
 | --- | --- | --- |
 | `id` | string | Stable event ID in the `evt_<usage_id>` format. |
+| `session_id` / `parent_session_id` / `root_session_id` | string/null | Session hierarchy identity fields for agent/subagent and multi-turn workflows. |
 | `event_type` | string | Event type, parsed from the payload first and derived from the endpoint when absent. |
 | `status` / `failed` / `status_code` / `upstream_status_code` | mixed | Request success/failure state and HTTP status. Successful requests default to `status_code=200` when no explicit status is available. |
 | `provider` / `model` / `original_model` / `model_alias` / `endpoint` | mixed | Model and routing metadata. |

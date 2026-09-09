@@ -9,7 +9,7 @@ import (
 )
 
 func TestUsageRecordFromPayloadStoresRequestIDAndHomeIP(t *testing.T) {
-	payload := `{"timestamp":"2026-05-29T01:02:03Z","request_id":"req-usage-1","executor_type":"CodexWebsocketsExecutor","tokens":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`
+	payload := `{"timestamp":"2026-05-29T01:02:03Z","request_id":"req-usage-1","session_id":"slot:pi-worker-1","parent_session_id":"slot:pi-main-root","executor_type":"CodexWebsocketsExecutor","tokens":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`
 
 	record, errRecord := UsageRecordFromPayload(payload, "192.0.2.10")
 	if errRecord != nil {
@@ -18,6 +18,12 @@ func TestUsageRecordFromPayloadStoresRequestIDAndHomeIP(t *testing.T) {
 
 	if record.RequestID != "req-usage-1" {
 		t.Fatalf("request id = %q, want req-usage-1", record.RequestID)
+	}
+	if record.SessionID != "slot:pi-worker-1" {
+		t.Fatalf("session id = %q, want slot:pi-worker-1", record.SessionID)
+	}
+	if record.ParentSessionID != "slot:pi-main-root" {
+		t.Fatalf("parent session id = %q, want slot:pi-main-root", record.ParentSessionID)
 	}
 	if record.HomeIP != "192.0.2.10" {
 		t.Fatalf("home ip = %q, want 192.0.2.10", record.HomeIP)
@@ -317,5 +323,67 @@ func TestUsageRecordFromPayloadDerivesCPALabelFromPayloadOwnership(t *testing.T)
 
 	if record.CPALabel != "node-from-payload" {
 		t.Fatalf("CPA label = %q, want node-from-payload", record.CPALabel)
+	}
+}
+
+func TestRepositoryResolveRootSessionIDMultiLevel(t *testing.T) {
+	db, errDB := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "home.db"))
+	if errDB != nil {
+		t.Fatalf("open sqlite: %v", errDB)
+	}
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate: %v", errMigrate)
+	}
+	repo := &Repository{db: db}
+	ctx := context.Background()
+	meta := UsageRuntimeMetadata{HomeIP: "127.0.0.1"}
+
+	// 1. Root turn: session = root-1, parent = ""
+	p1 := `{"timestamp":"2026-09-04T10:00:00Z","request_id":"req-1","session_id":"root-1","model":"gpt-4","provider":"openai"}`
+	rec1, err1 := repo.AppendUsageWithRuntime(ctx, p1, meta)
+	if err1 != nil {
+		t.Fatalf("AppendUsage p1: %v", err1)
+	}
+	if rec1.RootSessionID != "root-1" {
+		t.Fatalf("rec1.RootSessionID = %q, want root-1", rec1.RootSessionID)
+	}
+
+	// 2. Child turn: session = child-1, parent = root-1 (CPA sends no root_session_id)
+	p2 := `{"timestamp":"2026-09-04T10:01:00Z","request_id":"req-2","session_id":"child-1","parent_session_id":"root-1","model":"gpt-4","provider":"openai"}`
+	rec2, err2 := repo.AppendUsageWithRuntime(ctx, p2, meta)
+	if err2 != nil {
+		t.Fatalf("AppendUsage p2: %v", err2)
+	}
+	if rec2.RootSessionID != "root-1" {
+		t.Fatalf("rec2.RootSessionID = %q, want root-1", rec2.RootSessionID)
+	}
+
+	// 3. Grandchild turn: session = grandchild-1, parent = child-1 (CPA sends no root_session_id)
+	p3 := `{"timestamp":"2026-09-04T10:02:00Z","request_id":"req-3","session_id":"grandchild-1","parent_session_id":"child-1","model":"gpt-4","provider":"openai"}`
+	rec3, err3 := repo.AppendUsageWithRuntime(ctx, p3, meta)
+	if err3 != nil {
+		t.Fatalf("AppendUsage p3: %v", err3)
+	}
+	if rec3.RootSessionID != "root-1" {
+		t.Fatalf("rec3.RootSessionID = %q, want root-1 (Home-maintained true root)", rec3.RootSessionID)
+	}
+
+	// 4. Verify in DB that all three records are queryable by root_session_id = root-1
+	var rootMatches []UsageRecord
+	if errFind := db.Where("root_session_id = ?", "root-1").Find(&rootMatches).Error; errFind != nil {
+		t.Fatalf("find by root_session_id: %v", errFind)
+	}
+	if len(rootMatches) != 3 {
+		t.Fatalf("found %d records with root_session_id = root-1, want 3", len(rootMatches))
+	}
+
+	// 5. Self-referential loop guard
+	pLoop := `{"timestamp":"2026-09-04T10:03:00Z","request_id":"req-loop","session_id":"loop-node","parent_session_id":"loop-node","model":"gpt-4","provider":"openai"}`
+	recLoop, errLoop := repo.AppendUsageWithRuntime(ctx, pLoop, meta)
+	if errLoop != nil {
+		t.Fatalf("AppendUsage pLoop: %v", errLoop)
+	}
+	if recLoop.RootSessionID != "loop-node" {
+		t.Fatalf("recLoop.RootSessionID = %q, want loop-node", recLoop.RootSessionID)
 	}
 }

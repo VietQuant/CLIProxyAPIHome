@@ -118,7 +118,7 @@ func TestGetCapabilitiesReturnsUsageObservabilityFlags(t *testing.T) {
 	if !ok {
 		t.Fatalf("capabilities = %T, want object", payload["capabilities"])
 	}
-	for _, key := range []string{"quota_snapshots", "quota_snapshot_details", "usage", "usage_overview", "usage_records", "usage_record_details", "usage_aggregates", "usage_export", "usage_provider_health", "usage_credential_health", "usage_realtime", "usage_token_breakdown_v2", "request_log_index", "request_events", "request_event_details", "request_event_export", "request_event_filters", "request_events_details", "request_events_export", "request_events_filters", "requestEvents", "requestEventDetails", "requestEventExport", "requestEventFilters", "requestEventsDetails", "requestEventsExport", "requestEventsFilters", "oauth_usage", "logs", "request_error_logs", "model_channel_bindings", "topology", "credential_cooldown_reset"} {
+	for _, key := range []string{"quota_snapshots", "quota_snapshot_details", "usage", "usage_overview", "usage_records", "usage_record_details", "usage_aggregates", "usage_export", "usage_provider_health", "usage_credential_health", "usage_realtime", "usage_token_breakdown_v2", "usage_session_tree", "request_log_index", "request_events", "request_event_details", "request_event_export", "request_event_filters", "request_events_details", "request_events_export", "request_events_filters", "requestEvents", "requestEventDetails", "requestEventExport", "requestEventFilters", "requestEventsDetails", "requestEventsExport", "requestEventsFilters", "oauth_usage", "logs", "request_error_logs", "model_channel_bindings", "topology", "credential_cooldown_reset"} {
 		if capabilities[key] != true {
 			t.Fatalf("capabilities[%s] = %v, want true", key, capabilities[key])
 		}
@@ -365,7 +365,7 @@ func TestListRequestEventsFiltersEffectiveStatusCode(t *testing.T) {
 	defer closeRepo()
 	seedUsageObservabilityManagementRecord(t, handler)
 
-	payload := `{"timestamp":"2026-06-10T01:02:04Z","event_type":"completion","provider":"openai","model":"gpt-4.1-mini","api_key":"client-key-secret-1234","request_id":"req-obs-200","cpa_node_id":"cpa-a","cpa_label":"cpa-a:8317","endpoint":"/v1/chat/completions","executor_type":"CodexWebsocketsExecutor","auth_index":"auth-observability","auth_type":"oauth","latency_ms":100,"tokens":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
+	payload := `{"timestamp":"2026-06-10T01:02:04Z","event_type":"completion","provider":"openai","model":"gpt-4.1-mini","api_key":"client-key-secret-1234","request_id":"req-obs-200","session_id":"sess-child-1","parent_session_id":"sess-root-main","cpa_node_id":"cpa-a","cpa_label":"cpa-a:8317","endpoint":"/v1/chat/completions","executor_type":"CodexWebsocketsExecutor","auth_index":"auth-observability","auth_type":"oauth","latency_ms":100,"tokens":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
 	if _, errUsage := handler.repo.AppendUsageWithRuntime(context.Background(), payload, cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}); errUsage != nil {
 		t.Fatalf("AppendUsage(200) error = %v", errUsage)
 	}
@@ -395,6 +395,26 @@ func TestListRequestEventsFiltersEffectiveStatusCode(t *testing.T) {
 	item, ok := items[0].(map[string]any)
 	if !ok || item["request_id"] != "req-obs-1" {
 		t.Fatalf("item = %#v, want req-obs-1", items[0])
+	}
+
+	// Test filtering by session_id
+	respSession := httptest.NewRecorder()
+	reqSession := httptest.NewRequest(http.MethodGet, "/request-events?session_id=sess-child-1&limit=10", nil)
+	engine.ServeHTTP(respSession, reqSession)
+	if respSession.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want %d", respSession.Code, respSession.Body.String(), http.StatusOK)
+	}
+	var respSessionData map[string]any
+	if errDecode := json.Unmarshal(respSession.Body.Bytes(), &respSessionData); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if respSessionData["total"] != float64(1) {
+		t.Fatalf("total = %v, want 1 record for sess-child-1", respSessionData["total"])
+	}
+	itemsSession := respSessionData["items"].([]any)
+	itemSess := itemsSession[0].(map[string]any)
+	if itemSess["session_id"] != "sess-child-1" || itemSess["parent_session_id"] != "sess-root-main" {
+		t.Fatalf("session fields = (%v, %v), want (sess-child-1, sess-root-main)", itemSess["session_id"], itemSess["parent_session_id"])
 	}
 }
 
@@ -1731,5 +1751,456 @@ func seedUsageObservabilityProviderAPIKeyManagementRecord(t *testing.T, handler 
 	payload := `{"timestamp":"2026-06-10T01:04:03Z","provider":"openai","model":"gpt-4.1-mini","api_key":"client-key-secret-1234","request_id":"req-obs-provider-key","endpoint":"/v1/chat/completions","executor_type":"OpenAICompatibleExecutor","auth_index":"provider-key-1","auth_type":"provider_api_key","latency_ms":1600,"tokens":{"input_tokens":80,"output_tokens":40,"total_tokens":120}}`
 	if _, errUsage := handler.repo.AppendUsage(context.Background(), payload, "192.0.2.10"); errUsage != nil {
 		t.Fatalf("AppendUsage(provider api key) error = %v", errUsage)
+	}
+}
+
+func TestGetSessionTreeOnDemandRetrieval(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+
+	// 1. Root turn 1
+	p1 := `{"timestamp":"2026-08-31T10:00:00Z","request_id":"req-root-1","session_id":"sess-main-root","root_session_id":"sess-main-root","model":"gpt-5.6","provider":"openai","latency_ms":5000,"tokens":{"input_tokens":1000,"output_tokens":500,"total_tokens":1500}}`
+	// 2. Root turn 2 (spawns subagent)
+	p2 := `{"timestamp":"2026-08-31T10:01:00Z","request_id":"req-root-2","session_id":"sess-main-root","root_session_id":"sess-main-root","model":"gpt-5.6","provider":"openai","latency_ms":7000,"tokens":{"input_tokens":2000,"output_tokens":800,"total_tokens":2800}}`
+	// 3. Subagent turn 1
+	p3 := `{"timestamp":"2026-08-31T10:01:30Z","request_id":"req-sub-1","session_id":"sess-subagent-a","parent_session_id":"sess-main-root","root_session_id":"sess-main-root","model":"gpt-5.6","provider":"openai","latency_ms":4000,"tokens":{"input_tokens":800,"output_tokens":300,"total_tokens":1100}}`
+
+	ctx := context.Background()
+	runtime := cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, p1, runtime); err != nil {
+		t.Fatalf("AppendUsage p1: %v", err)
+	}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, p2, runtime); err != nil {
+		t.Fatalf("AppendUsage p2: %v", err)
+	}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, p3, runtime); err != nil {
+		t.Fatalf("AppendUsage p3: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/usage/session-tree", handler.GetSessionTree)
+
+	// Query via subagent request_id to verify reverse root resolution and tree reconstruction
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?request_id=req-sub-1", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.Code, resp.Body.String())
+	}
+	var res cluster.SessionTreeResult
+	if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal SessionTreeResult: %v", err)
+	}
+
+	if res.RootSessionID != "sess-main-root" {
+		t.Fatalf("RootSessionID = %q, want sess-main-root", res.RootSessionID)
+	}
+	if res.TotalSessions != 2 {
+		t.Fatalf("TotalSessions = %d, want 2", res.TotalSessions)
+	}
+	if res.TotalRequests != 3 {
+		t.Fatalf("TotalRequests = %d, want 3", res.TotalRequests)
+	}
+	if len(res.Tree) != 1 {
+		t.Fatalf("len(Tree) = %d, want 1 root node", len(res.Tree))
+	}
+	rootNode := res.Tree[0]
+	if rootNode.SessionID != "sess-main-root" || len(rootNode.Children) != 1 {
+		t.Fatalf("rootNode = %+v, want 1 child", rootNode)
+	}
+	if rootNode.Children[0].SessionID != "sess-subagent-a" {
+		t.Fatalf("child = %+v, want sess-subagent-a", rootNode.Children[0])
+	}
+	if len(rootNode.Timeline) != 2 || rootNode.Timeline[0].RequestID != "req-root-1" {
+		t.Fatalf("rootNode.Timeline = %+v", rootNode.Timeline)
+	}
+}
+
+func TestGetSessionTreeDeepHierarchyWithoutRootID(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+
+	// 1. Root session (no parent, no root)
+	p1 := `{"timestamp":"2026-08-31T10:00:00Z","request_id":"req-deep-root","session_id":"sess-deep-root","model":"gpt-5.6","provider":"openai","latency_ms":3000,"tokens":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}`
+	// 2. Child session (parent = sess-deep-root, no explicit root)
+	p2 := `{"timestamp":"2026-08-31T10:01:00Z","request_id":"req-deep-child","session_id":"sess-deep-child","parent_session_id":"sess-deep-root","model":"gpt-5.6","provider":"openai","latency_ms":2000,"tokens":{"input_tokens":200,"output_tokens":80,"total_tokens":280}}`
+	// 3. Grandchild session (parent = sess-deep-child, no explicit root)
+	p3 := `{"timestamp":"2026-08-31T10:02:00Z","request_id":"req-deep-grandchild","session_id":"sess-deep-grandchild","parent_session_id":"sess-deep-child","model":"gpt-5.6","provider":"openai","latency_ms":1500,"tokens":{"input_tokens":300,"output_tokens":90,"total_tokens":390}}`
+
+	ctx := context.Background()
+	runtime := cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, p1, runtime); err != nil {
+		t.Fatalf("AppendUsage p1: %v", err)
+	}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, p2, runtime); err != nil {
+		t.Fatalf("AppendUsage p2: %v", err)
+	}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, p3, runtime); err != nil {
+		t.Fatalf("AppendUsage p3: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/usage/session-tree", handler.GetSessionTree)
+
+	// Query via grandchild request_id to verify recursive ancestor ascension
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?request_id=req-deep-grandchild", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.Code, resp.Body.String())
+	}
+	var res cluster.SessionTreeResult
+	if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal SessionTreeResult: %v", err)
+	}
+
+	if res.RootSessionID != "sess-deep-root" {
+		t.Fatalf("RootSessionID = %q, want sess-deep-root", res.RootSessionID)
+	}
+	if res.TotalSessions != 3 {
+		t.Fatalf("TotalSessions = %d, want 3", res.TotalSessions)
+	}
+	if res.TotalRequests != 3 {
+		t.Fatalf("TotalRequests = %d, want 3", res.TotalRequests)
+	}
+	if len(res.Tree) != 1 {
+		t.Fatalf("len(Tree) = %d, want 1 root node", len(res.Tree))
+	}
+	rootNode := res.Tree[0]
+	if rootNode.SessionID != "sess-deep-root" || len(rootNode.Children) != 1 {
+		t.Fatalf("rootNode = %+v, want 1 child", rootNode)
+	}
+	childNode := rootNode.Children[0]
+	if childNode.SessionID != "sess-deep-child" || len(childNode.Children) != 1 {
+		t.Fatalf("childNode = %+v, want 1 grandchild", childNode)
+	}
+	grandchildNode := childNode.Children[0]
+	if grandchildNode.SessionID != "sess-deep-grandchild" {
+		t.Fatalf("grandchildNode = %+v, want sess-deep-grandchild", grandchildNode)
+	}
+}
+
+func TestUsageExportCSVIncludesSessionHierarchy(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+
+	payload := `{"timestamp":"2026-08-31T10:00:00Z","request_id":"req-export-sess","session_id":"sess-exp-1","parent_session_id":"sess-exp-root","root_session_id":"sess-exp-root","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}`
+	ctx := context.Background()
+	runtime := cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, payload, runtime); err != nil {
+		t.Fatalf("AppendUsage: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/usage/export", handler.ExportUsageRecords)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/usage/export?format=csv", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.Code, resp.Body.String())
+	}
+
+	reader := csv.NewReader(resp.Body)
+	records, errRead := reader.ReadAll()
+	if errRead != nil {
+		t.Fatalf("csv ReadAll: %v", errRead)
+	}
+	if len(records) < 2 {
+		t.Fatalf("records len = %d, want at least header + 1 row", len(records))
+	}
+	header := records[0]
+	headerMap := make(map[string]int)
+	for idx, col := range header {
+		headerMap[col] = idx
+	}
+
+	for _, field := range []string{"session_id", "parent_session_id", "root_session_id"} {
+		idx, ok := headerMap[field]
+		if !ok {
+			t.Fatalf("missing field %q in csv header", field)
+		}
+		val := records[1][idx]
+		if field == "session_id" && val != "sess-exp-1" {
+			t.Fatalf("session_id val = %q, want sess-exp-1", val)
+		}
+		if (field == "parent_session_id" || field == "root_session_id") && val != "sess-exp-root" {
+			t.Fatalf("%s val = %q, want sess-exp-root", field, val)
+		}
+	}
+}
+
+func TestGetSessionTreeCycleSafety(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+
+	// Malformed cyclic relationship: A points to parent B, B points to parent A
+	pA := `{"timestamp":"2026-08-31T10:00:00Z","request_id":"req-cycle-a","session_id":"sess-cycle-a","parent_session_id":"sess-cycle-b","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`
+	pB := `{"timestamp":"2026-08-31T10:01:00Z","request_id":"req-cycle-b","session_id":"sess-cycle-b","parent_session_id":"sess-cycle-a","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`
+
+	ctx := context.Background()
+	runtime := cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, pA, runtime); err != nil {
+		t.Fatalf("AppendUsage pA: %v", err)
+	}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, pB, runtime); err != nil {
+		t.Fatalf("AppendUsage pB: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/usage/session-tree", handler.GetSessionTree)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?id=sess-cycle-a", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.Code, resp.Body.String())
+	}
+
+	var res cluster.SessionTreeResult
+	if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+		t.Fatalf("JSON marshal/unmarshal cycle error: %v", err)
+	}
+	if res.TotalSessions != 2 {
+		t.Fatalf("TotalSessions = %d, want 2", res.TotalSessions)
+	}
+}
+
+func TestGetSessionTreeLateParentBackfill(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+
+	// Turn 1 of subagent logged without parent_session_id
+	p1 := `{"timestamp":"2026-08-31T10:00:00Z","request_id":"req-late-root","session_id":"sess-late-root","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`
+	p2 := `{"timestamp":"2026-08-31T10:01:00Z","request_id":"req-late-sub-1","session_id":"sess-late-sub","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`
+	// Turn 2 of subagent logged WITH parent_session_id
+	p3 := `{"timestamp":"2026-08-31T10:02:00Z","request_id":"req-late-sub-2","session_id":"sess-late-sub","parent_session_id":"sess-late-root","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`
+
+	ctx := context.Background()
+	runtime := cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, p1, runtime); err != nil {
+		t.Fatalf("AppendUsage p1: %v", err)
+	}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, p2, runtime); err != nil {
+		t.Fatalf("AppendUsage p2: %v", err)
+	}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, p3, runtime); err != nil {
+		t.Fatalf("AppendUsage p3: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/usage/session-tree", handler.GetSessionTree)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?request_id=req-late-root", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.Code, resp.Body.String())
+	}
+
+	var res cluster.SessionTreeResult
+	if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal SessionTreeResult: %v", err)
+	}
+	if len(res.Tree) != 1 {
+		t.Fatalf("len(Tree) = %d, want 1 root node", len(res.Tree))
+	}
+	rootNode := res.Tree[0]
+	if len(rootNode.Children) != 1 || rootNode.Children[0].SessionID != "sess-late-sub" {
+		t.Fatalf("rootNode children = %+v, want sess-late-sub child", rootNode.Children)
+	}
+	if res.TotalRequests != 3 {
+		t.Fatalf("TotalRequests = %d, want 3 (including early turn of late subagent)", res.TotalRequests)
+	}
+	childNode := rootNode.Children[0]
+	if childNode.RequestCount != 2 || len(childNode.Timeline) != 2 {
+		t.Fatalf("childNode requests = %d, timeline len = %d, want 2", childNode.RequestCount, len(childNode.Timeline))
+	}
+	if childNode.Timeline[0].RequestID != "req-late-sub-1" || childNode.Timeline[1].RequestID != "req-late-sub-2" {
+		t.Fatalf("childNode timeline = %+v, want req-late-sub-1 then req-late-sub-2", childNode.Timeline)
+	}
+
+	// Verify querying by numeric usage ID or event ID resolves properly
+	respID := httptest.NewRecorder()
+	reqID := httptest.NewRequest(http.MethodGet, "/usage/session-tree?id=1", nil)
+	engine.ServeHTTP(respID, reqID)
+	if respID.Code != http.StatusOK {
+		t.Fatalf("query by id=1 failed: status = %d", respID.Code)
+	}
+}
+
+func TestGetSessionTreeQueryByParentOnly(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+
+	// Child record referencing parent "parent-only-sess" which never had its own usage record
+	childPayload := `{"timestamp":"2026-08-31T10:00:00Z","request_id":"req-child-only","session_id":"child-sess-1","parent_session_id":"parent-only-sess","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`
+	ctx := context.Background()
+	runtime := cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, childPayload, runtime); err != nil {
+		t.Fatalf("AppendUsage: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/usage/session-tree", handler.GetSessionTree)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?id=parent-only-sess", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.Code, resp.Body.String())
+	}
+
+	var res cluster.SessionTreeResult
+	if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal SessionTreeResult: %v", err)
+	}
+	if res.TotalSessions != 1 {
+		t.Fatalf("TotalSessions = %d, want 1", res.TotalSessions)
+	}
+}
+
+func TestSessionTreeAndListToleranceForNonUUIDAndPrefixedInput(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+
+	ctx := context.Background()
+	runtime := cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}
+
+	// 1. Non-UUID human-readable task projected to UUIDv8 as stored by modern CPA
+	rootRawTask := "slot:pi-worker-subagent"
+	rootUUIDv8 := cluster.NormalizeToCanonicalUUID(rootRawTask)
+	childRawTask := "slot:pi-leaf-task"
+	childUUIDv8 := cluster.NormalizeToCanonicalUUID(childRawTask)
+
+	pRoot := fmt.Sprintf(`{"timestamp":"2026-08-31T10:00:00Z","request_id":"req-v8-root","session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, rootUUIDv8)
+	pChild := fmt.Sprintf(`{"timestamp":"2026-08-31T10:01:00Z","request_id":"req-v8-child","session_id":"%s","parent_session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, childUUIDv8, rootUUIDv8)
+
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, pRoot, runtime); err != nil {
+		t.Fatalf("AppendUsage root: %v", err)
+	}
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, pChild, runtime); err != nil {
+		t.Fatalf("AppendUsage child: %v", err)
+	}
+
+	// 2. Native UUID stored without prefix
+	cleanUUID := "01a07e72-c84d-7fd3-8207-d217b41cc649"
+	pClean := fmt.Sprintf(`{"timestamp":"2026-08-31T10:02:00Z","request_id":"req-clean-uuid","session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, cleanUUID)
+	if _, err := handler.repo.AppendUsageWithRuntime(ctx, pClean, runtime); err != nil {
+		t.Fatalf("AppendUsage clean UUID: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/usage/session-tree", handler.GetSessionTree)
+	engine.GET("/request-events", handler.ListRequestEvents)
+
+	// Test A: Query /usage/session-tree using human-readable raw task identifier
+	{
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?id="+rootRawTask, nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("session-tree status = %d body = %s", resp.Code, resp.Body.String())
+		}
+		var res cluster.SessionTreeResult
+		if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal SessionTreeResult: %v", err)
+		}
+		if res.RootSessionID != rootUUIDv8 {
+			t.Fatalf("RootSessionID = %q, want %q", res.RootSessionID, rootUUIDv8)
+		}
+		if res.TotalSessions != 2 {
+			t.Fatalf("TotalSessions = %d, want 2 (root + child)", res.TotalSessions)
+		}
+	}
+
+	// Test B: Query /usage/session-tree using prefixed native UUID (codex:...)
+	{
+		prefixed := "codex:" + cleanUUID
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?id="+prefixed, nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("session-tree with prefixed UUID status = %d body = %s", resp.Code, resp.Body.String())
+		}
+		var res cluster.SessionTreeResult
+		if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal SessionTreeResult: %v", err)
+		}
+		if res.RootSessionID != cleanUUID {
+			t.Fatalf("RootSessionID = %q, want %q", res.RootSessionID, cleanUUID)
+		}
+		if res.TotalSessions != 1 {
+			t.Fatalf("TotalSessions = %d, want 1", res.TotalSessions)
+		}
+	}
+
+	// Test C: Filter /request-events by raw session_id
+	{
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/request-events?session_id="+rootRawTask, nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("request-events status = %d body = %s", resp.Code, resp.Body.String())
+		}
+		var listRes map[string]any
+		if err := json.Unmarshal(resp.Body.Bytes(), &listRes); err != nil {
+			t.Fatalf("unmarshal list response: %v", err)
+		}
+		items, _ := listRes["items"].([]any)
+		if len(items) != 1 {
+			t.Fatalf("items count = %d, want 1 for raw task tolerance", len(items))
+		}
+		firstRec := items[0].(map[string]any)
+		if firstRec["session_id"] != rootUUIDv8 {
+			t.Fatalf("session_id in record = %v, want %s", firstRec["session_id"], rootUUIDv8)
+		}
+	}
+
+	// Test D: Cross-version hybrid tree assembly (legacy parent raw session_id + modern child canonical UUIDv8 parent_session_id)
+	{
+		legacyParentID := "legacy-mixed-root-task"
+		canonicalParentUUID := cluster.NormalizeToCanonicalUUID(legacyParentID)
+		modernChildID := "modern-child-node"
+
+		pLegacyParent := fmt.Sprintf(`{"timestamp":"2026-08-31T11:00:00Z","request_id":"req-hybrid-parent","session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, legacyParentID)
+		pModernChild := fmt.Sprintf(`{"timestamp":"2026-08-31T11:01:00Z","request_id":"req-hybrid-child","session_id":"%s","parent_session_id":"%s","model":"gpt-5.6","provider":"openai","latency_ms":1000,"tokens":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}`, modernChildID, canonicalParentUUID)
+
+		if _, err := handler.repo.AppendUsageWithRuntime(ctx, pLegacyParent, runtime); err != nil {
+			t.Fatalf("AppendUsage legacy parent: %v", err)
+		}
+		if _, err := handler.repo.AppendUsageWithRuntime(ctx, pModernChild, runtime); err != nil {
+			t.Fatalf("AppendUsage modern child: %v", err)
+		}
+
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/usage/session-tree?id="+legacyParentID, nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("hybrid session-tree status = %d body = %s", resp.Code, resp.Body.String())
+		}
+		var res cluster.SessionTreeResult
+		if err := json.Unmarshal(resp.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal SessionTreeResult: %v", err)
+		}
+		if len(res.Tree) != 1 {
+			t.Fatalf("len(res.Tree) = %d, want 1 (child should be nested under parent via canonical lookup)", len(res.Tree))
+		}
+		if len(res.Tree[0].Children) != 1 || res.Tree[0].Children[0].SessionID != modernChildID {
+			t.Fatalf("child node failed to nest under legacy parent, got %#v", res.Tree[0].Children)
+		}
 	}
 }

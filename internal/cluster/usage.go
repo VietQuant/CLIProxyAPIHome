@@ -14,11 +14,18 @@ import (
 	"gorm.io/gorm"
 )
 
-const defaultUsageServiceTier = "auto"
+const (
+	defaultUsageServiceTier  = "auto"
+	MaxSessionTreeAscentHops = 16
+	MaxSessionTreeBFSDepth   = 16
+	MaxSessionTreeRecords    = 5000
+	SessionTreeBFSChunkSize  = 250
+	maxSessionRootCacheSize  = 25000
+)
 
 type UsageRecord struct {
 	ID        uint      `gorm:"column:id;primaryKey;autoIncrement;index:idx_usage_time_order,priority:2"`
-	Timestamp time.Time `gorm:"column:timestamp;not null;index:idx_usage_timestamp;index:idx_usage_time_order,priority:1,sort:desc;index:idx_usage_source_time,priority:2,sort:desc;index:idx_usage_auth_time,priority:2,sort:desc;index:idx_usage_failed_time,priority:2,sort:desc;index:idx_usage_failed_status_time,priority:3,sort:desc;index:idx_usage_provider_model_time,priority:3,sort:desc;index:idx_usage_provider_time,priority:2,sort:desc;index:idx_usage_endpoint_time,priority:2,sort:desc;index:idx_usage_home_time,priority:2,sort:desc;index:idx_usage_auth_type_time,priority:2,sort:desc"`
+	Timestamp time.Time `gorm:"column:timestamp;not null;index:idx_usage_timestamp;index:idx_usage_time_order,priority:1,sort:desc;index:idx_usage_source_time,priority:2,sort:desc;index:idx_usage_auth_time,priority:2,sort:desc;index:idx_usage_failed_time,priority:2,sort:desc;index:idx_usage_failed_status_time,priority:3,sort:desc;index:idx_usage_provider_model_time,priority:3,sort:desc;index:idx_usage_provider_time,priority:2,sort:desc;index:idx_usage_endpoint_time,priority:2,sort:desc;index:idx_usage_home_time,priority:2,sort:desc;index:idx_usage_auth_type_time,priority:2,sort:desc;index:idx_usage_session_time,priority:2,sort:desc;index:idx_usage_parent_session_time,priority:2,sort:desc;index:idx_usage_root_session_time,priority:2,sort:desc"`
 	LatencyMS int64     `gorm:"column:latency_ms;not null;default:0"`
 	TTFTMS    int64     `gorm:"column:ttft_ms;not null;default:0"`
 	Source    string    `gorm:"column:source;index:idx_usage_source;index:idx_usage_source_time,priority:1"`
@@ -63,6 +70,9 @@ type UsageRecord struct {
 	AuthType                   string    `gorm:"column:auth_type;index:idx_usage_auth_type_time,priority:1"`
 	APIKey                     string    `gorm:"column:api_key;index:idx_usage_api_key"`
 	RequestID                  string    `gorm:"column:request_id;index:idx_usage_request_id"`
+	SessionID                  string    `gorm:"column:session_id;index:idx_usage_session_time,priority:1"`
+	ParentSessionID            string    `gorm:"column:parent_session_id;index:idx_usage_parent_session_time,priority:1"`
+	RootSessionID              string    `gorm:"column:root_session_id;index:idx_usage_root_session_time,priority:1"`
 	UpstreamRequestID          string    `gorm:"column:upstream_request_id;index:idx_usage_upstream_request_id"`
 	EventType                  string    `gorm:"column:event_type;index:idx_usage_event_type;index:idx_usage_event_time,priority:1"`
 	UpstreamStatusCode         int       `gorm:"column:upstream_status_code;not null;default:0;index:idx_usage_upstream_status_code"`
@@ -161,6 +171,17 @@ func UsageRecordFromPayloadWithRuntime(payload string, metadata UsageRuntimeMeta
 		receivedAt = receivedAt.UTC()
 	}
 
+	sessionID := strings.TrimSpace(usagePayloadString(payload, "session_id", "session.id", "sessionId"))
+	parentSessionID := strings.TrimSpace(usagePayloadString(payload, "parent_session_id", "parent_session.id", "parentSessionId"))
+	rootSessionID := strings.TrimSpace(usagePayloadString(payload, "root_session_id", "root_session.id", "rootSessionId"))
+	if rootSessionID == "" {
+		if parentSessionID != "" {
+			rootSessionID = parentSessionID
+		} else if sessionID != "" {
+			rootSessionID = sessionID
+		}
+	}
+
 	record := &UsageRecord{
 		Timestamp:                  timestamp.UTC(),
 		LatencyMS:                  gjson.Get(payload, "latency_ms").Int(),
@@ -200,6 +221,9 @@ func UsageRecordFromPayloadWithRuntime(payload string, metadata UsageRuntimeMeta
 		AuthType:                   strings.TrimSpace(gjson.Get(payload, "auth_type").String()),
 		APIKey:                     strings.TrimSpace(gjson.Get(payload, "api_key").String()),
 		RequestID:                  strings.TrimSpace(gjson.Get(payload, "request_id").String()),
+		SessionID:                  sessionID,
+		ParentSessionID:            parentSessionID,
+		RootSessionID:              rootSessionID,
 		UpstreamRequestID:          usagePayloadString(payload, "upstream_request_id", "upstream.request_id", "response.request_id", "response.id"),
 		UpstreamStatusCode:         int(usagePayloadInt(payload, "upstream_status_code", "upstream.status_code", "response.status_code")),
 		HomeIP:                     usageHomeIP(payload, metadata),
@@ -318,6 +342,10 @@ func (r *Repository) AppendUsageWithRuntime(ctx context.Context, payload string,
 	}
 
 	ctx = contextOrBackground(ctx)
+	if record.ParentSessionID != "" && (record.RootSessionID == "" || record.RootSessionID == record.ParentSessionID) {
+		record.RootSessionID = r.resolveRootSessionID(ctx, db, record.SessionID, record.ParentSessionID)
+	}
+
 	record.QuotaCredentialID = ""
 	record.QuotaIdentityVersion = 0
 	record.QuotaIdentityKey = ""
@@ -345,6 +373,106 @@ func (r *Repository) AppendUsageWithRuntime(ctx context.Context, payload string,
 		log.WithError(errQuota).Warn("usage quota observation ignored")
 	}
 	return record, nil
+}
+
+func (r *Repository) getCachedRootSessionID(sessionID string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	r.sessionRootCacheMu.RLock()
+	defer r.sessionRootCacheMu.RUnlock()
+	if r.sessionRootCache == nil {
+		return "", false
+	}
+	root, ok := r.sessionRootCache[sessionID]
+	return root, ok
+}
+
+func (r *Repository) setCachedRootSessionID(sessionID, rootID string) {
+	if r == nil || sessionID == "" || rootID == "" {
+		return
+	}
+	r.sessionRootCacheMu.Lock()
+	defer r.sessionRootCacheMu.Unlock()
+	if r.sessionRootCache == nil {
+		r.sessionRootCache = make(map[string]string)
+	}
+	if len(r.sessionRootCache) >= maxSessionRootCacheSize {
+		// Amortized eviction: prune half of the entries when capacity is exceeded
+		pruned := 0
+		for k := range r.sessionRootCache {
+			delete(r.sessionRootCache, k)
+			pruned++
+			if pruned >= maxSessionRootCacheSize/2 {
+				break
+			}
+		}
+	}
+	r.sessionRootCache[sessionID] = rootID
+}
+
+// resolveRootSessionID determines the true top-level root session identifier for a session with a parent.
+// It checks the in-memory root cache first (0 DB reads on hot paths), falling back to ascending the parent link
+// up to MaxSessionTreeAscentHops in the usage store, returning the ultimate root ancestor.
+func (r *Repository) resolveRootSessionID(ctx context.Context, db *gorm.DB, sessionID, parentSessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	parentSessionID = strings.TrimSpace(parentSessionID)
+	if parentSessionID == "" || parentSessionID == sessionID {
+		return sessionID
+	}
+	if r == nil {
+		return parentSessionID
+	}
+
+	// Fast path: parent root is already cached in memory (0 DB queries)
+	if cachedRoot, ok := r.getCachedRootSessionID(parentSessionID); ok && cachedRoot != "" {
+		r.setCachedRootSessionID(sessionID, cachedRoot)
+		return cachedRoot
+	}
+
+	if db == nil {
+		return parentSessionID
+	}
+
+	curr := parentSessionID
+	visited := map[string]bool{sessionID: true, curr: true}
+	for hops := 0; hops < MaxSessionTreeAscentHops; hops++ {
+		if cachedRoot, ok := r.getCachedRootSessionID(curr); ok && cachedRoot != "" {
+			curr = cachedRoot
+			break
+		}
+
+		var parentRec UsageRecord
+		// Legacy compatibility: currCandidates enables parent link traversal across legacy and canonical records.
+		// TODO(session-cleanup): Revert to single-key matching once legacy session records are phased out.
+		currCandidates := SessionQueryCandidates(curr)
+		err := db.WithContext(ctx).Table("usage").
+			Select("session_id, parent_session_id, root_session_id").
+			Where("session_id IN (?)", currCandidates).
+			Order("timestamp DESC").
+			Limit(1).
+			Scan(&parentRec).Error
+		if err != nil || parentRec.SessionID == "" {
+			break
+		}
+		if parentRec.SessionID != "" {
+			curr = parentRec.SessionID
+		}
+		if parentRec.RootSessionID != "" && parentRec.RootSessionID != curr && !visited[parentRec.RootSessionID] {
+			curr = parentRec.RootSessionID
+			break
+		}
+		if parentRec.ParentSessionID != "" && parentRec.ParentSessionID != curr && !visited[parentRec.ParentSessionID] {
+			curr = parentRec.ParentSessionID
+			visited[curr] = true
+		} else {
+			break
+		}
+	}
+
+	r.setCachedRootSessionID(parentSessionID, curr)
+	r.setCachedRootSessionID(sessionID, curr)
+	return curr
 }
 
 // UsagePayloadWithRuntimeMetadata fills missing runtime ownership fields without overriding reported values.

@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
@@ -45,6 +46,7 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			"usage_credential_health":              true,
 			"usage_realtime":                       true,
 			"usage_token_breakdown_v2":             usageTokenBreakdownV2,
+			"usage_session_tree":                   true,
 			"request_log_index":                    true,
 			"request_events":                       true,
 			"request_event_details":                true,
@@ -262,6 +264,25 @@ func (h *Handler) ExportUsageRecords(c *gin.Context) {
 	writer.Flush()
 }
 
+// GetSessionTree handles on-demand retrieval of the hierarchical session tree and request timeline.
+func (h *Handler) GetSessionTree(c *gin.Context) {
+	identifier := firstNonEmptyQuery(c, "session_id", "session-id", "sessionId", "root_session_id", "root-session-id", "rootSessionId", "request_id", "request-id", "requestId", "id")
+	if strings.TrimSpace(identifier) == "" {
+		respondUsageHTTPError(c, newUsageHTTPError("missing_parameter", "session_id, root_session_id, or request_id query parameter is required"))
+		return
+	}
+	ctx, cancel := h.requestContext(c)
+	defer cancel()
+
+	result, errTree := h.repo.GetSessionTree(ctx, identifier)
+	if errTree != nil {
+		logrus.Errorf("GetSessionTree error for identifier %q: %v", identifier, errTree)
+		respondError(c, http.StatusInternalServerError, "internal_error", newUsageHTTPError("internal_error", "failed to retrieve session tree"))
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
 func (h *Handler) GetUsageRealtime(c *gin.Context) {
 	query, errParse := parseUsageRealtimeHTTPQuery(c)
 	if errParse != nil {
@@ -434,34 +455,37 @@ func (e *usageHTTPError) Error() string {
 }
 
 type usageRecordHTTPQuery struct {
-	From           *time.Time
-	To             *time.Time
-	Provider       string
-	Model          string
-	HomeIP         string
-	Endpoint       string
-	CredentialType string
-	Timezone       string
-	Status         string
-	StatusCode     *int
-	RequestID      string
-	User           string
-	UserID         *uint
-	ClientKey      string
-	ClientKeyID    *uint
-	CredentialID   string
-	AuthIndex      string
-	ExecutorType   string
-	EventType      string
-	CPANode        string
-	MinLatencyMS   *int64
-	MaxLatencyMS   *int64
-	MinAmount      *float64
-	MaxAmount      *float64
-	Search         string
-	Limit          int
-	Offset         int
-	Sort           string
+	From            *time.Time
+	To              *time.Time
+	Provider        string
+	Model           string
+	HomeIP          string
+	Endpoint        string
+	CredentialType  string
+	Timezone        string
+	Status          string
+	StatusCode      *int
+	RequestID       string
+	SessionID       string
+	ParentSessionID string
+	RootSessionID   string
+	User            string
+	UserID          *uint
+	ClientKey       string
+	ClientKeyID     *uint
+	CredentialID    string
+	AuthIndex       string
+	ExecutorType    string
+	EventType       string
+	CPANode         string
+	MinLatencyMS    *int64
+	MaxLatencyMS    *int64
+	MinAmount       *float64
+	MaxAmount       *float64
+	Search          string
+	Limit           int
+	Offset          int
+	Sort            string
 }
 
 type usageAggregateHTTPQuery struct {
@@ -601,6 +625,9 @@ func parseUsageRecordHTTPQueryWithPagination(c *gin.Context, includePagination b
 	}
 	query.StatusCode = statusCode
 	query.RequestID = firstNonEmptyQuery(c, "request_id", "request-id")
+	query.SessionID = firstNonEmptyQuery(c, "session_id", "session-id", "sessionId")
+	query.ParentSessionID = firstNonEmptyQuery(c, "parent_session_id", "parent-session-id", "parentSessionId")
+	query.RootSessionID = firstNonEmptyQuery(c, "root_session_id", "root-session-id", "rootSessionId")
 	query.User = strings.TrimSpace(c.Query("user"))
 	userID, errUserID := optionalUint(c.Query("user_id"), "user_id")
 	if errUserID != nil {
@@ -1085,33 +1112,36 @@ func parseUsageBool(raw string) bool {
 
 func usageObservabilityRecordQueryFromHTTP(query usageRecordHTTPQuery) cluster.UsageObservabilityRecordQuery {
 	return cluster.UsageObservabilityRecordQuery{
-		From:           query.From,
-		To:             query.To,
-		Provider:       query.Provider,
-		Model:          query.Model,
-		HomeIP:         query.HomeIP,
-		Endpoint:       query.Endpoint,
-		CredentialType: query.CredentialType,
-		Status:         query.Status,
-		StatusCode:     query.StatusCode,
-		RequestID:      query.RequestID,
-		User:           query.User,
-		UserID:         query.UserID,
-		ClientKey:      query.ClientKey,
-		ClientKeyID:    query.ClientKeyID,
-		CredentialID:   query.CredentialID,
-		AuthIndex:      query.AuthIndex,
-		ExecutorType:   query.ExecutorType,
-		EventType:      query.EventType,
-		CPANode:        query.CPANode,
-		MinLatencyMS:   query.MinLatencyMS,
-		MaxLatencyMS:   query.MaxLatencyMS,
-		MinAmount:      query.MinAmount,
-		MaxAmount:      query.MaxAmount,
-		Search:         query.Search,
-		Limit:          query.Limit,
-		Offset:         query.Offset,
-		Sort:           query.Sort,
+		From:            query.From,
+		To:              query.To,
+		Provider:        query.Provider,
+		Model:           query.Model,
+		HomeIP:          query.HomeIP,
+		Endpoint:        query.Endpoint,
+		CredentialType:  query.CredentialType,
+		Status:          query.Status,
+		StatusCode:      query.StatusCode,
+		RequestID:       query.RequestID,
+		SessionID:       query.SessionID,
+		ParentSessionID: query.ParentSessionID,
+		RootSessionID:   query.RootSessionID,
+		User:            query.User,
+		UserID:          query.UserID,
+		ClientKey:       query.ClientKey,
+		ClientKeyID:     query.ClientKeyID,
+		CredentialID:    query.CredentialID,
+		AuthIndex:       query.AuthIndex,
+		ExecutorType:    query.ExecutorType,
+		EventType:       query.EventType,
+		CPANode:         query.CPANode,
+		MinLatencyMS:    query.MinLatencyMS,
+		MaxLatencyMS:    query.MaxLatencyMS,
+		MinAmount:       query.MinAmount,
+		MaxAmount:       query.MaxAmount,
+		Search:          query.Search,
+		Limit:           query.Limit,
+		Offset:          query.Offset,
+		Sort:            query.Sort,
 	}
 }
 
@@ -1549,6 +1579,9 @@ func usageRecordSummaryResponse(record *cluster.UsageObservabilityRecord) gin.H 
 		"usage_id":             record.UsageID,
 		"timestamp":            record.Timestamp.UTC().Format(time.RFC3339Nano),
 		"request_id":           record.RequestID,
+		"session_id":           emptyStringAsNil(record.SessionID),
+		"parent_session_id":    emptyStringAsNil(record.ParentSessionID),
+		"root_session_id":      emptyStringAsNil(record.RootSessionID),
 		"upstream_request_id":  emptyStringAsNil(record.UpstreamRequestID),
 		"event_type":           emptyStringAsNil(record.EventType),
 		"status":               record.Status,
@@ -1713,6 +1746,9 @@ func usageExportRecordMap(record *cluster.UsageObservabilityRecord) map[string]a
 		"usage_id":                              record.UsageID,
 		"timestamp":                             record.Timestamp.UTC().Format(time.RFC3339Nano),
 		"request_id":                            record.RequestID,
+		"session_id":                            emptyStringAsNil(record.SessionID),
+		"parent_session_id":                     emptyStringAsNil(record.ParentSessionID),
+		"root_session_id":                       emptyStringAsNil(record.RootSessionID),
 		"upstream_request_id":                   emptyStringAsNil(record.UpstreamRequestID),
 		"event_type":                            emptyStringAsNil(record.EventType),
 		"status":                                record.Status,
@@ -1785,7 +1821,7 @@ func usageExportRecordMap(record *cluster.UsageObservabilityRecord) map[string]a
 
 func usageExportCSVHeader() []string {
 	return []string{
-		"id", "usage_id", "timestamp", "request_id", "upstream_request_id", "event_type", "status", "failed", "status_code", "upstream_status_code",
+		"id", "usage_id", "timestamp", "request_id", "upstream_request_id", "session_id", "parent_session_id", "root_session_id", "event_type", "status", "failed", "status_code", "upstream_status_code",
 		"source", "provider", "model", "original_model", "endpoint", "service_tier", "reasoning_effort", "executor_type",
 		"input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens",
 		"token_breakdown_schema_version", "token_breakdown_quality", "token_breakdown_total_tokens",
