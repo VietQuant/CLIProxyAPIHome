@@ -315,6 +315,22 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 		models = applyExcludedModels(models, excluded)
+	case "devin":
+		models = registry.GetDevinModels()
+		models = applyExcludedModels(models, excluded)
+	case "meta":
+		models = registry.GetMetaModels()
+		if len(configModels) > 0 {
+			models = configModels
+		} else if entry := r.resolveConfigMetaKey(cfg, a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildMetaConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
 	default:
 		if len(configModels) > 0 {
 			providerKey := provider
@@ -599,6 +615,14 @@ func (r *Runtime) resolveConfigXAIKey(cfg *config.Config, auth *coreauth.Auth) *
 	return resolveConfigCodexStyleKey(auth, cfg.XAIKey)
 }
 
+// resolveConfigMetaKey resolves a config Meta key.
+func (r *Runtime) resolveConfigMetaKey(cfg *config.Config, auth *coreauth.Auth) *config.MetaKey {
+	if cfg == nil {
+		return nil
+	}
+	return resolveConfigCodexStyleKey(auth, cfg.MetaKey)
+}
+
 func resolveConfigCodexStyleKey(auth *coreauth.Auth, entries []config.CodexKey) *config.CodexKey {
 	if auth == nil {
 		return nil
@@ -851,6 +875,14 @@ func buildXAIConfigModels(entry *config.XAIKey) []*ModelInfo {
 		return nil
 	}
 	return buildConfigModels(entry.Models, "xai", "xai")
+}
+
+// buildMetaConfigModels builds Meta config models.
+func buildMetaConfigModels(entry *config.MetaKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "meta", "meta")
 }
 
 // buildCodexConfigModels builds a codex config models.

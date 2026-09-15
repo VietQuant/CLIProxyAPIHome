@@ -150,6 +150,7 @@ func TestGetProviderKeyRoutesReturnConfiguredModels(t *testing.T) {
 	engine.GET("/claude-api-key", handler.GetClaudeKeys)
 	engine.GET("/codex-api-key", handler.GetCodexKeys)
 	engine.GET("/xai-api-key", handler.GetXAIKeys)
+	engine.GET("/meta-api-key", handler.GetMetaKeys)
 	engine.GET("/vertex-api-key", handler.GetVertexCompatKeys)
 	engine.GET("/config.yaml", handler.GetConfigYAML)
 
@@ -187,6 +188,11 @@ xai-api-key:
     models:
       - name: "xai-upstream"
         alias: "xai-alias"
+meta-api-key:
+  - api-key: meta-key
+    models:
+      - name: "meta-upstream"
+        alias: "meta-alias"
 vertex-api-key:
   - api-key: vertex-key
     base-url: "https://vertex.example"
@@ -216,6 +222,7 @@ vertex-api-key:
 		{Path: "/claude-api-key", Key: "claude-api-key", WantName: "claude-upstream", WantAlias: "claude-alias"},
 		{Path: "/codex-api-key", Key: "codex-api-key", WantName: "codex-upstream", WantAlias: "codex-alias"},
 		{Path: "/xai-api-key", Key: "xai-api-key", WantName: "xai-upstream", WantAlias: "xai-alias"},
+		{Path: "/meta-api-key", Key: "meta-api-key", WantName: "meta-upstream", WantAlias: "meta-alias"},
 		{Path: "/vertex-api-key", Key: "vertex-api-key", WantName: "vertex-upstream", WantAlias: "vertex-alias"},
 	}
 	for _, tc := range cases {

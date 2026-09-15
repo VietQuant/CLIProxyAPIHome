@@ -16,7 +16,7 @@ import (
 const homeConfigModelsMetadataKey = "home_config_models"
 
 // ConfigSynthesizer generates Auth entries from configuration API keys.
-// It handles Gemini, Interactions, Claude, Codex, xAI, OpenAI-compat, and Vertex-compat providers.
+// It handles Gemini, Interactions, Claude, Codex, xAI, Meta, OpenAI-compat, and Vertex-compat providers.
 type ConfigSynthesizer struct{}
 
 // NewConfigSynthesizer creates a new ConfigSynthesizer instance.
@@ -41,6 +41,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeCodexKeys(ctx)...)
 	// xAI API Keys
 	out = append(out, s.synthesizeXAIKeys(ctx)...)
+	// Meta API Keys
+	out = append(out, s.synthesizeMetaKeys(ctx)...)
 	// OpenAI-compat
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
 	// Vertex-compat
@@ -232,6 +234,11 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 // synthesizeXAIKeys creates Auth entries for xAI API keys.
 func (s *ConfigSynthesizer) synthesizeXAIKeys(ctx *SynthesisContext) []*coreauth.Auth {
 	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.XAIKey, "xai")
+}
+
+// synthesizeMetaKeys creates Auth entries for Meta API keys.
+func (s *ConfigSynthesizer) synthesizeMetaKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.MetaKey, "meta")
 }
 
 func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entries []appconfig.CodexKey, provider string) []*coreauth.Auth {

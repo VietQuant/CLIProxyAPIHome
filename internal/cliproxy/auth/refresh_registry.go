@@ -20,6 +20,7 @@ func init() {
 	registerRefreshLead("antigravity", &antigravityRefreshLead)
 	registerRefreshLead("kimi", &kimiRefreshLead)
 	registerRefreshLead("xai", &xaiRefreshLead)
+	registerRefreshLead("meta", nil)
 }
 
 // registerRefreshLead handles a register refresh lead.

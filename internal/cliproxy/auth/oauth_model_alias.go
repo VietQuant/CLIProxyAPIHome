@@ -301,7 +301,7 @@ func modelAliasChannel(auth *Auth) string {
 // and auth kind. Returns empty string if the provider/authKind combination doesn't support
 // OAuth model alias (e.g., API key authentication).
 //
-// Supported channels: vertex, antigravity, claude, codex, kimi, xai.
+// Supported channels: vertex, antigravity, claude, codex, kimi, xai, meta, devin.
 func OAuthModelAliasChannel(provider, authKind string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	authKind = strings.ToLower(strings.TrimSpace(authKind))
@@ -319,7 +319,7 @@ func OAuthModelAliasChannel(provider, authKind string) string {
 		return "claude"
 	case "codex":
 		return "codex"
-	case "antigravity", "kimi", "xai":
+	case "antigravity", "kimi", "xai", "meta", "devin":
 		return provider
 	default:
 		return ""

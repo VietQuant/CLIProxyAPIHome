@@ -361,6 +361,11 @@ func apiCallTokenValueFromMetadata(metadata map[string]any) string {
 			return v
 		}
 	}
+	for _, key := range []string{"api_key", "session_token"} {
+		if v := stringFromAny(metadata[key]); v != "" {
+			return v
+		}
+	}
 	return ""
 }
 

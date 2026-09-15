@@ -146,6 +146,9 @@ type Config struct {
 	// XAIKey defines xAI API key configurations using the same structure as Codex API keys.
 	XAIKey []XAIKey `yaml:"xai-api-key" json:"xai-api-key"`
 
+	// MetaKey defines Meta API key configurations using the same structure as Codex API keys.
+	MetaKey []MetaKey `yaml:"meta-api-key" json:"meta-api-key"`
+
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
@@ -169,10 +172,10 @@ type Config struct {
 
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
 	// These aliases affect both model listing and model routing for supported channels:
-	// vertex, antigravity, claude, codex, kimi, xai.
+	// vertex, antigravity, claude, codex, kimi, xai, meta, devin.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
-	// gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
+	// gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, meta-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
 
 	// Payload defines default and override rules for provider payload parameters.
@@ -562,6 +565,12 @@ type XAIKey = CodexKey
 // XAIModel uses the Codex model mapping structure for xAI models.
 type XAIModel = CodexModel
 
+// MetaKey uses the Codex API key structure for native Meta Muse execution.
+type MetaKey = CodexKey
+
+// MetaModel uses the Codex model mapping structure for Meta Muse models.
+type MetaModel = CodexModel
+
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
@@ -834,6 +843,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize xAI keys: drop entries without base-url
 	cfg.SanitizeXAIKeys()
 
+	// Sanitize Meta keys: require an API key and default the official base URL.
+	cfg.SanitizeMetaKeys()
+
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
 
@@ -1047,6 +1059,13 @@ func (cfg *Config) NormalizeProviderCredentialIDs() error {
 		}
 		cfg.XAIKey[i].ID, cfg.XAIKey[i].UUID = id, ""
 	}
+	for i := range cfg.MetaKey {
+		id, errNormalize := normalizeProviderCredentialID(cfg.MetaKey[i].ID, cfg.MetaKey[i].UUID)
+		if errNormalize != nil {
+			return errNormalize
+		}
+		cfg.MetaKey[i].ID, cfg.MetaKey[i].UUID = id, ""
+	}
 	for i := range cfg.ClaudeKey {
 		id, errNormalize := normalizeProviderCredentialID(cfg.ClaudeKey[i].ID, cfg.ClaudeKey[i].UUID)
 		if errNormalize != nil {
@@ -1140,6 +1159,39 @@ func (cfg *Config) SanitizeXAIKeys() {
 	for i := range cfg.XAIKey {
 		cfg.XAIKey[i].AlphaSearch = false
 	}
+}
+
+// SanitizeMetaKeys normalizes Meta API key entries, defaulting BaseURL to https://api.meta.ai/v1 if empty.
+func (cfg *Config) SanitizeMetaKeys() {
+	if cfg == nil {
+		return
+	}
+	cfg.MetaKey = sanitizeMetaKeyEntries(cfg.MetaKey)
+}
+
+func sanitizeMetaKeyEntries(entries []MetaKey) []MetaKey {
+	if len(entries) == 0 {
+		return entries
+	}
+	out := make([]MetaKey, 0, len(entries))
+	for i := range entries {
+		e := entries[i]
+		e.APIKey = strings.TrimSpace(e.APIKey)
+		// meta-api-key requires a valid API key. DCA tokens require OAuth storage.
+		if e.APIKey == "" || strings.HasPrefix(e.APIKey, "dca:") {
+			continue
+		}
+		e.Prefix = normalizeModelPrefix(e.Prefix)
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		if e.BaseURL == "" {
+			e.BaseURL = "https://api.meta.ai/v1"
+		}
+		e.Headers = NormalizeHeaders(e.Headers)
+		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
+		e.AlphaSearch = false
+		out = append(out, e)
+	}
+	return out
 }
 
 func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {

@@ -17,6 +17,7 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 		testConfigAPIKeyAuth("vertex-id", "vertex", "config:vertex-apikey[token]", "vertex-key"),
 		testConfigAPIKeyAuth("codex-id", "codex", "config:codex[token]", "codex-key"),
 		testConfigAPIKeyAuth("xai-id", "xai", "config:xai[token]", "xai-key"),
+		testConfigAPIKeyAuth("meta-id", "meta", "config:meta[token]", "meta-key"),
 		testConfigAPIKeyAuth("claude-id", "claude", "config:claude[token]", "claude-key"),
 		testConfigAPIKeyAuth("compat-id", "compat", "config:compat[token]", "compat-key"),
 		testConfigAPIKeyAuth("codex-file-id", "codex", "auth-file.json", "ignored-key"),
@@ -31,12 +32,12 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 		}},
 	}
 	auths[4].Metadata = map[string]any{"disable_cooling": false, "request_retry": 0}
-	auths[6].Attributes["compat_name"] = "compat"
-	auths[6].Attributes["provider_key"] = "compat"
-	auths[6].Metadata = map[string]any{"request_retry": 2}
+	auths[7].Attributes["compat_name"] = "compat"
+	auths[7].Attributes["provider_key"] = "compat"
+	auths[7].Metadata = map[string]any{"request_retry": 2}
 
 	counts := ApplyCredentialConfigToRoot(root, auths)
-	if counts.GeminiKeys != 1 || counts.InteractionsKeys != 1 || counts.VertexKeys != 1 || counts.CodexKeys != 1 || counts.XAIKeys != 1 || counts.ClaudeKeys != 1 || counts.OpenAICompatibility != 1 {
+	if counts.GeminiKeys != 1 || counts.InteractionsKeys != 1 || counts.VertexKeys != 1 || counts.CodexKeys != 1 || counts.XAIKeys != 1 || counts.MetaKeys != 1 || counts.ClaudeKeys != 1 || counts.OpenAICompatibility != 1 {
 		t.Fatalf("unexpected credential counts: %#v", counts)
 	}
 	if got := root["debug"]; got != true {
@@ -85,7 +86,11 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 	if !ok || len(claudeKeys) != 1 || claudeKeys[0].APIKey != "claude-key" {
 		t.Fatalf("unexpected claude-api-key root value: %#v", root["claude-api-key"])
 	}
-	if vertexKeys[0].ID != "vertex-id" || codexKeys[0].ID != "codex-id" || xaiKeys[0].ID != "xai-id" || claudeKeys[0].ID != "claude-id" {
+	metaKeys, ok := root["meta-api-key"].([]appconfig.MetaKey)
+	if !ok || len(metaKeys) != 1 || metaKeys[0].APIKey != "meta-key" {
+		t.Fatalf("unexpected meta-api-key root value: %#v", root["meta-api-key"])
+	}
+	if vertexKeys[0].ID != "vertex-id" || codexKeys[0].ID != "codex-id" || xaiKeys[0].ID != "xai-id" || metaKeys[0].ID != "meta-id" || claudeKeys[0].ID != "claude-id" {
 		t.Fatalf("provider credential IDs were not exported")
 	}
 	compat, ok := root["openai-compatibility"].([]appconfig.OpenAICompatibility)

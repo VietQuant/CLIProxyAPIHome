@@ -21,7 +21,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
+	devinauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/devin"
 	kimiauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/kimi"
+	metaauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/meta"
 	xaiauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
@@ -241,6 +243,79 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
+// RequestDevinToken handles request Devin token.
+func (h *Handler) RequestDevinToken(c *gin.Context) {
+	pkceCodes, errPKCE := devinauth.GeneratePKCECodes()
+	if errPKCE != nil {
+		log.Errorf("cluster oauth: failed to generate devin PKCE codes: %v", errPKCE)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate PKCE codes"})
+		return
+	}
+	state, errState := generateOAuthState("dvn")
+	if errState != nil {
+		log.Errorf("cluster oauth: failed to generate devin state: %v", errState)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
+		return
+	}
+
+	authSvc := devinauth.NewDevinAuthService(h.oauthConfig())
+	redirectURI := devinauth.DefaultRedirectURI()
+	authURL := authSvc.BuildAuthorizationURL(redirectURI, pkceCodes.CodeChallenge, state)
+	if errRegister := h.registerOAuthSession(c, "devin", state, map[string]any{
+		"code_verifier":  pkceCodes.CodeVerifier,
+		"code_challenge": pkceCodes.CodeChallenge,
+		"redirect_uri":   redirectURI,
+	}); errRegister != nil {
+		respondError(c, http.StatusInternalServerError, "oauth_session_failed", errRegister)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+// RequestMetaToken handles request Meta token.
+func (h *Handler) RequestMetaToken(c *gin.Context) {
+	cfg := h.oauthConfig()
+	ctx, cancel := context.WithTimeout(requestContextOrBackground(c), 30*time.Second)
+	defer cancel()
+
+	state, errState := generateOAuthState("mta")
+	if errState != nil {
+		log.Errorf("cluster oauth: failed to generate meta state: %v", errState)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
+		return
+	}
+
+	metaAuth := metaauth.NewMetaAuth(cfg)
+	deviceFlow, errDevice := metaAuth.StartDeviceFlow(ctx)
+	if errDevice != nil {
+		log.Errorf("cluster oauth: failed to start meta device flow: %v", errDevice)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+		return
+	}
+	authURL, userCode, errView := deviceFlowAuthView(deviceFlow.VerificationURIComplete, deviceFlow.VerificationURI, deviceFlow.UserCode)
+	if errView != nil {
+		log.Errorf("cluster oauth: meta device flow missing verification target: %v", errView)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+		return
+	}
+
+	if errRegister := h.registerOAuthSession(c, "meta", state, map[string]any{
+		"device_code": deviceFlow.DeviceCode,
+		"user_code":   userCode,
+	}); errRegister != nil {
+		respondError(c, http.StatusInternalServerError, "oauth_session_failed", errRegister)
+		return
+	}
+
+	go h.waitForMetaAuthorization(state, metaAuth, deviceFlow)
+
+	payload := gin.H{"status": "ok", "url": authURL, "state": state}
+	if userCode != "" {
+		payload["user_code"] = userCode
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
 // GetAuthStatus returns an auth status.
 func (h *Handler) GetAuthStatus(c *gin.Context) {
 	// Validate request inputs before mutating persisted state.
@@ -367,7 +442,7 @@ func (h *Handler) handleOAuthCallback(c *gin.Context) {
 	} else {
 		provider, errProvider = normalizeOAuthProvider(providerInput)
 	}
-	if errProvider != nil || (!isPlugin && provider == "kimi") {
+	if errProvider != nil || (!isPlugin && (provider == "kimi" || provider == "meta")) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "unsupported provider"})
 		return
 	}
@@ -451,6 +526,8 @@ func (h *Handler) processOAuthCallback(provider, state, code string) {
 		errProcess = h.exchangeAntigravityCallback(ctx, code, data)
 	case "xai":
 		errProcess = h.exchangeXAICallback(ctx, code, data)
+	case "devin":
+		errProcess = h.exchangeDevinCallback(ctx, code, data)
 	default:
 		errProcess = fmt.Errorf("unsupported provider: %s", provider)
 	}
@@ -507,6 +584,41 @@ func (h *Handler) waitForKimiAuthorization(state string, kimiAuth *kimiauth.Kimi
 	}
 	if errComplete := h.repo.CompleteOAuthSession(context.Background(), state); errComplete != nil {
 		log.Errorf("cluster oauth: complete kimi session failed: %v", errComplete)
+	}
+}
+
+// waitForMetaAuthorization waits for Meta device-flow authorization to complete.
+func (h *Handler) waitForMetaAuthorization(state string, metaAuth *metaauth.MetaAuth, deviceFlow *metaauth.DeviceCodeResponse) {
+	ctx, cancel := context.WithTimeout(context.Background(), 16*time.Minute)
+	defer cancel()
+
+	authBundle, errWait := metaAuth.WaitForAuthorization(ctx, deviceFlow)
+	if errWait != nil {
+		_ = h.repo.SetOAuthSessionError(context.Background(), state, "Authentication failed")
+		log.Errorf("cluster oauth: meta authorization failed: %v", errWait)
+		return
+	}
+	if authBundle == nil || authBundle.TokenData == nil {
+		_ = h.repo.SetOAuthSessionError(context.Background(), state, "Authentication failed")
+		return
+	}
+
+	tokenStorage := metaAuth.CreateTokenStorage(authBundle)
+	if tokenStorage == nil || strings.TrimSpace(tokenStorage.AccessToken) == "" {
+		_ = h.repo.SetOAuthSessionError(context.Background(), state, "Authentication failed")
+		return
+	}
+
+	storeCtx, cancelStore := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelStore()
+	fileName := metaauth.CredentialFileName(tokenStorage.Email, tokenStorage.DCAToken)
+	if errStore := h.storeOAuthMetadataWithContext(storeCtx, metaauth.BuildOAuthMetadata(tokenStorage), fileName); errStore != nil {
+		_ = h.repo.SetOAuthSessionError(context.Background(), state, "Failed to save authentication tokens")
+		log.Errorf("cluster oauth: store meta token failed: %v", errStore)
+		return
+	}
+	if errComplete := h.repo.CompleteOAuthSession(context.Background(), state); errComplete != nil {
+		log.Errorf("cluster oauth: complete meta session failed: %v", errComplete)
 	}
 }
 
@@ -801,6 +913,28 @@ func (h *Handler) exchangeXAICallback(ctx context.Context, code string, data map
 		metadata["sub"] = tokenData.Subject
 	}
 	return h.storeOAuthMetadataWithContext(ctx, metadata, xaiauth.CredentialFileName(tokenData.Email, tokenData.Subject))
+}
+
+// exchangeDevinCallback handles a Devin OAuth callback.
+func (h *Handler) exchangeDevinCallback(ctx context.Context, code string, data map[string]any) error {
+	codeVerifier := stringFromAny(data["code_verifier"])
+	if codeVerifier == "" {
+		return fmt.Errorf("missing PKCE verifier")
+	}
+	authSvc := devinauth.NewDevinAuthService(h.oauthConfig())
+	token, errExchange := authSvc.ExchangeCodeForToken(ctx, strings.TrimSpace(code), codeVerifier)
+	if errExchange != nil {
+		return errExchange
+	}
+	sessionToken := devinauth.FormatSessionToken(token)
+	if sessionToken == "" {
+		return fmt.Errorf("token exchange returned empty session token")
+	}
+	userName, userID, orgID, errSelf := authSvc.FetchSelfProfile(ctx, sessionToken)
+	if errSelf != nil {
+		log.Warnf("cluster oauth: failed to fetch devin user profile: %v", errSelf)
+	}
+	return h.storeOAuthMetadataWithContext(ctx, devinauth.BuildOAuthMetadata(sessionToken, userName, userID, orgID), devinauth.CredentialFileName(userName, userID))
 }
 
 // storeOAuthMetadataWithContext stores an o auth metadata with context.
@@ -1147,6 +1281,24 @@ func validateOAuthState(state string) error {
 	return nil
 }
 
+// deviceFlowAuthView picks the client-facing verification URL and user code.
+// verification_uri_complete is preferred. A bare verification_uri requires user_code.
+func deviceFlowAuthView(completeURI, verificationURI, userCode string) (authURL, code string, err error) {
+	code = strings.TrimSpace(userCode)
+	completeURI = strings.TrimSpace(completeURI)
+	verificationURI = strings.TrimSpace(verificationURI)
+	if completeURI != "" {
+		return completeURI, code, nil
+	}
+	if verificationURI != "" {
+		if code == "" {
+			return "", "", fmt.Errorf("device flow missing user code")
+		}
+		return verificationURI, code, nil
+	}
+	return "", "", fmt.Errorf("device flow missing verification url")
+}
+
 // normalizeOAuthProvider normalizes an o auth provider.
 func normalizeOAuthProvider(provider string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
@@ -1160,6 +1312,10 @@ func normalizeOAuthProvider(provider string) (string, error) {
 		return "kimi", nil
 	case "xai", "x-ai", "x.ai", "grok":
 		return "xai", nil
+	case "devin":
+		return "devin", nil
+	case "meta", "muse":
+		return "meta", nil
 	default:
 		return "", errUnsupportedProvider
 	}
@@ -1171,7 +1327,7 @@ func authStatusMessage(provider string, err error) string {
 		return ""
 	}
 	switch provider {
-	case "anthropic", "codex", "xai":
+	case "anthropic", "codex", "xai", "devin":
 		return "Failed to exchange authorization code for tokens"
 	case "antigravity":
 		return "Failed to exchange token"

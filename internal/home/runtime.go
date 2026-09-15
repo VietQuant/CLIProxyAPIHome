@@ -338,6 +338,7 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 	}
 
 	registry.StartModelsUpdater(runCtx)
+	registry.StartDevinModelsUpdater(runCtx)
 	r.registerModelRefreshCallback()
 	managementasset.SetCurrentConfig(r.cfg)
 	managementasset.StartAutoUpdater(context.Background(), configPath)

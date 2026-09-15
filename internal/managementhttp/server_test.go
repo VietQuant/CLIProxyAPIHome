@@ -120,6 +120,12 @@ func TestClusterManagementAPIKeyUsageRouteRegistered(t *testing.T) {
 		{Method: http.MethodPut, Path: "/xai-api-key"},
 		{Method: http.MethodPatch, Path: "/xai-api-key"},
 		{Method: http.MethodDelete, Path: "/xai-api-key"},
+		{Method: http.MethodGet, Path: "/meta-api-key"},
+		{Method: http.MethodPut, Path: "/meta-api-key"},
+		{Method: http.MethodPatch, Path: "/meta-api-key"},
+		{Method: http.MethodDelete, Path: "/meta-api-key"},
+		{Method: http.MethodGet, Path: "/devin-auth-url"},
+		{Method: http.MethodGet, Path: "/meta-auth-url"},
 	} {
 		if reg.routes[route] == nil {
 			t.Fatalf("route %s %s was not registered", route.Method, route.Path)

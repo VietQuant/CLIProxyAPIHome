@@ -39,6 +39,8 @@ codex-api-key:
   - api-key: "c1"
 xai-api-key:
   - api-key: "x1"
+meta-api-key:
+  - api-key: "m1"
 claude-api-key:
   - api-key: "a1"
 openai-compatibility:
@@ -104,6 +106,7 @@ plugins:
 	assertNotContains("interactions-api-key:")
 	assertNotContains("codex-api-key:")
 	assertNotContains("xai-api-key:")
+	assertNotContains("meta-api-key:")
 	assertNotContains("claude-api-key:")
 	assertNotContains("openai-compatibility:")
 	assertNotContains("vertex-api-key:")

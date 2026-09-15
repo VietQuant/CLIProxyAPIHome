@@ -305,6 +305,8 @@ func isProviderAuthForConfigKey(auth *coreauth.Auth, key string) bool {
 		return auth.Provider == "codex" && strings.HasPrefix(source, "config:codex[")
 	case "xai-api-key":
 		return auth.Provider == "xai" && strings.HasPrefix(source, "config:xai[")
+	case "meta-api-key":
+		return auth.Provider == "meta" && strings.HasPrefix(source, "config:meta[")
 	case "claude-api-key":
 		return auth.Provider == "claude" && strings.HasPrefix(source, "config:claude[")
 	case "openai-compatibility":

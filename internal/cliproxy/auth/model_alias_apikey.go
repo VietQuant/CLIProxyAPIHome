@@ -68,6 +68,8 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 		upstreamModel = resolveUpstreamModelForCodexAPIKey(cfg, auth, requestedModel)
 	case "xai":
 		upstreamModel = resolveUpstreamModelForXAIAPIKey(cfg, auth, requestedModel)
+	case "meta":
+		upstreamModel = resolveUpstreamModelForMetaAPIKey(cfg, auth, requestedModel)
 	case "vertex":
 		upstreamModel = resolveUpstreamModelForVertexAPIKey(cfg, auth, requestedModel)
 	default:
@@ -325,6 +327,14 @@ func resolveXAIAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalcon
 	return resolveAPIKeyConfig(cfg.XAIKey, auth)
 }
 
+// resolveMetaAPIKeyConfig resolves a Meta api key config.
+func resolveMetaAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.MetaKey {
+	if cfg == nil {
+		return nil
+	}
+	return resolveAPIKeyConfig(cfg.MetaKey, auth)
+}
+
 // resolveVertexAPIKeyConfig resolves a vertex api key config.
 func resolveVertexAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.VertexCompatKey {
 	if cfg == nil {
@@ -372,6 +382,15 @@ func resolveUpstreamModelForCodexAPIKey(cfg *internalconfig.Config, auth *Auth, 
 // resolveUpstreamModelForXAIAPIKey resolves an upstream model for xAI api key.
 func resolveUpstreamModelForXAIAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
 	entry := resolveXAIAPIKeyConfig(cfg, auth)
+	if entry == nil {
+		return ""
+	}
+	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+}
+
+// resolveUpstreamModelForMetaAPIKey resolves an upstream model for Meta api key.
+func resolveUpstreamModelForMetaAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
+	entry := resolveMetaAPIKeyConfig(cfg, auth)
 	if entry == nil {
 		return ""
 	}

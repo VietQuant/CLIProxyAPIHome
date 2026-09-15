@@ -2208,12 +2208,14 @@ func isTerminalRefreshAuthError(errRefresh error) bool {
 }
 
 func authSupportsBuiltInRefresh(auth *Auth) bool {
-	if auth == nil || metaStringValue(auth.Metadata, "refresh_token") == "" {
+	if auth == nil {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
 	case "codex", "claude", "kimi", "antigravity", "xai":
-		return true
+		return metaStringValue(auth.Metadata, "refresh_token") != ""
+	case "meta":
+		return extractMetaDCAToken(auth) != ""
 	default:
 		return false
 	}

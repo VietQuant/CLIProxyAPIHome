@@ -193,6 +193,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/debug` |
 | `PATCH` | `/debug` |
 | `PUT` | `/debug` |
+| `GET` | `/devin-auth-url` |
 | `GET` | `/error-logs-max-files` |
 | `PATCH` | `/error-logs-max-files` |
 | `PUT` | `/error-logs-max-files` |
@@ -224,6 +225,11 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/max-retry-interval` |
 | `PATCH` | `/max-retry-interval` |
 | `PUT` | `/max-retry-interval` |
+| `DELETE` | `/meta-api-key` |
+| `GET` | `/meta-api-key` |
+| `PATCH` | `/meta-api-key` |
+| `PUT` | `/meta-api-key` |
+| `GET` | `/meta-auth-url` |
 | `GET` | `/model-definitions/:channel` |
 | `GET` | `/model-group-details` |
 | `POST` | `/model-group-details` |
@@ -379,6 +385,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
   "interactions-api-key": [],
   "codex-api-key": [],
   "xai-api-key": [],
+  "meta-api-key": [],
   "codex-header-defaults": {
     "user-agent": "",
     "beta-features": ""
@@ -459,6 +466,7 @@ interactions-api-key
 vertex-api-key
 codex-api-key
 xai-api-key
+meta-api-key
 claude-api-key
 openai-compatibility
 ```
@@ -2097,6 +2105,11 @@ PUT    /xai-api-key
 PATCH  /xai-api-key
 DELETE /xai-api-key
 
+GET    /meta-api-key
+PUT    /meta-api-key
+PATCH  /meta-api-key
+DELETE /meta-api-key
+
 GET    /vertex-api-key
 PUT    /vertex-api-key
 PATCH  /vertex-api-key
@@ -2573,6 +2586,8 @@ GET /codex-auth-url
 GET /antigravity-auth-url
 GET /kimi-auth-url
 GET /xai-auth-url
+GET /devin-auth-url
+GET /meta-auth-url
 GET /<plugin-provider>-auth-url
 ```
 
@@ -2586,7 +2601,7 @@ GET /<plugin-provider>-auth-url
 }
 ```
 
-`GET /kimi-auth-url` 会启动 device flow 并返回验证 URL，Home 在后台等待完成。
+`GET /kimi-auth-url` 和 `GET /meta-auth-url` 会启动 device flow 并返回验证 URL，Home 在后台等待完成。`GET /meta-auth-url` 在上游返回验证码时还会带上 `user_code`。如果 Meta 未提供 `verification_uri_complete`，客户端需要打开 `url` 并输入 `user_code`。
 
 `GET /<plugin-provider>-auth-url` 可用于 `GET /plugins` 返回的 Home-loaded 插件 provider；对应条目需要 `supports_oauth: true`、`effective_enabled: true`，并且 `oauth_provider` 非空。provider 路径段会规范化为小写，且只能包含字母、数字和连字符。
 
@@ -4159,6 +4174,7 @@ DELETE query：
 | `interactions-api-key` | array of `GeminiKey` | 原生 Google Interactions API-key credentials；应使用 provider-key routes。 |
 | `codex-api-key` | array of `CodexKey` | Codex API-key credentials；应使用 provider-key routes。 |
 | `xai-api-key` | array of `XAIKey` | 原生 xAI API-key credentials；应使用 provider-key routes。 |
+| `meta-api-key` | array of `MetaKey` | 原生 Meta Muse API-key credentials；应使用 provider-key routes。 |
 | `codex-header-defaults.user-agent` | string | 默认 Codex User-Agent。 |
 | `codex-header-defaults.beta-features` | string | 默认 Codex websocket beta features header。 |
 | `claude-api-key` | array of `ClaudeKey` | Claude API-key credentials；应使用 provider-key routes。 |

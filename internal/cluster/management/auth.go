@@ -79,6 +79,18 @@ func (h *Handler) PatchXAIKey(c *gin.Context) { h.patchAPIKey(c, "xai-api-key") 
 // DeleteXAIKey deletes an xAI key.
 func (h *Handler) DeleteXAIKey(c *gin.Context) { h.deleteAPIKey(c, "xai-api-key") }
 
+// GetMetaKeys returns Meta keys.
+func (h *Handler) GetMetaKeys(c *gin.Context) { h.getAPIKeyList(c, "meta-api-key") }
+
+// PutMetaKeys replaces Meta keys.
+func (h *Handler) PutMetaKeys(c *gin.Context) { h.putAPIKeyList(c, "meta-api-key") }
+
+// PatchMetaKey applies a partial update to a Meta key.
+func (h *Handler) PatchMetaKey(c *gin.Context) { h.patchAPIKey(c, "meta-api-key") }
+
+// DeleteMetaKey deletes a Meta key.
+func (h *Handler) DeleteMetaKey(c *gin.Context) { h.deleteAPIKey(c, "meta-api-key") }
+
 // GetClaudeKeys returns a claude keys.
 func (h *Handler) GetClaudeKeys(c *gin.Context) { h.getAPIKeyList(c, "claude-api-key") }
 
@@ -310,6 +322,12 @@ func (h *Handler) synthesizeAPIKeyBody(key string, body []byte) ([]*coreauth.Aut
 			return nil, errDecode
 		}
 		cfg.XAIKey = entries
+	case "meta-api-key":
+		var entries []appconfig.MetaKey
+		if errDecode := decodeListBody(body, key, &entries); errDecode != nil {
+			return nil, errDecode
+		}
+		cfg.MetaKey = entries
 	case "claude-api-key":
 		var entries []appconfig.ClaudeKey
 		if errDecode := decodeListBody(body, key, &entries); errDecode != nil {
@@ -333,6 +351,7 @@ func (h *Handler) synthesizeAPIKeyBody(key string, body []byte) ([]*coreauth.Aut
 	cfg.SanitizeVertexCompatKeys()
 	cfg.SanitizeCodexKeys()
 	cfg.SanitizeXAIKeys()
+	cfg.SanitizeMetaKeys()
 	cfg.SanitizeClaudeKeys()
 	cfg.SanitizeOpenAICompatibility()
 	return synthesizeConfigAuths(cfg), nil
@@ -566,6 +585,8 @@ func isAPIKeyAuthForKey(auth *coreauth.Auth, key string) bool {
 		return auth.Provider == "codex" && strings.HasPrefix(source, "config:codex[")
 	case "xai-api-key":
 		return auth.Provider == "xai" && strings.HasPrefix(source, "config:xai[")
+	case "meta-api-key":
+		return auth.Provider == "meta" && strings.HasPrefix(source, "config:meta[")
 	case "vertex-api-key":
 		return auth.Provider == "vertex" && strings.HasPrefix(source, "config:vertex-apikey[")
 	case "openai-compatibility":
@@ -622,7 +643,7 @@ func apiKeyAuthToMap(auth *coreauth.Auth, key string) map[string]any {
 			}}
 		}
 	}
-	if (key == "codex-api-key" || key == "xai-api-key") && strings.EqualFold(attrs["websockets"], "true") {
+	if (key == "codex-api-key" || key == "xai-api-key" || key == "meta-api-key") && strings.EqualFold(attrs["websockets"], "true") {
 		item["websockets"] = true
 	}
 	if key == "codex-api-key" && strings.EqualFold(attrs[coreauth.AttributeCodexAlphaSearch], "true") {
@@ -638,7 +659,7 @@ func apiKeyAuthToMap(auth *coreauth.Auth, key string) map[string]any {
 		item["request-retry"] = requestRetry
 	}
 	switch key {
-	case "codex-api-key", "xai-api-key", "gemini-api-key", "interactions-api-key", "vertex-api-key", "claude-api-key":
+	case "codex-api-key", "xai-api-key", "meta-api-key", "gemini-api-key", "interactions-api-key", "vertex-api-key", "claude-api-key":
 		models := credentialAPIKeyModels(auth)
 		if len(models) > 0 {
 			item["models"] = models

@@ -41,6 +41,11 @@ xai-api-key:
     models:
       - name: grok-4.5
         alias: grok-latest
+meta-api-key:
+  - api-key: meta-key
+    models:
+      - name: muse-spark-1.3
+        alias: muse-latest
 `)
 	writeFile(t, filepath.Join(authDir, "codex.json"), `{"type":"codex","email":"a@example.com","access_token":"token"}`)
 
@@ -69,7 +74,7 @@ xai-api-key:
 		t.Fatalf("cluster_events count after second import = %d, want %d", secondEventCount, firstEventCount)
 	}
 	assertTableCount(t, db, &APIKeyRecord{}, 1)
-	assertActiveAuthCount(t, db, 4)
+	assertActiveAuthCount(t, db, 5)
 	auths, errAuths := repo.ListAuths(context.Background())
 	if errAuths != nil {
 		t.Fatalf("ListAuths() error = %v", errAuths)

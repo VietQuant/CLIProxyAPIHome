@@ -64,3 +64,22 @@ func performOAuthStatusRequest(t *testing.T, handler http.Handler, state string)
 	}
 	return body
 }
+
+func TestDeviceFlowAuthView(t *testing.T) {
+	url, code, errView := deviceFlowAuthView("https://auth.example/complete", "https://auth.example/verify", "ABCD")
+	if errView != nil || url != "https://auth.example/complete" || code != "ABCD" {
+		t.Fatalf("complete URI view = %q %q %v", url, code, errView)
+	}
+
+	url, code, errView = deviceFlowAuthView("", "https://auth.example/verify", "ABCD")
+	if errView != nil || url != "https://auth.example/verify" || code != "ABCD" {
+		t.Fatalf("verification URI view = %q %q %v", url, code, errView)
+	}
+
+	if _, _, errView = deviceFlowAuthView("", "https://auth.example/verify", ""); errView == nil {
+		t.Fatal("expected error when verification URI has no user code")
+	}
+	if _, _, errView = deviceFlowAuthView("", "", "ABCD"); errView == nil {
+		t.Fatal("expected error when both verification URLs are empty")
+	}
+}

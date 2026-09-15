@@ -124,6 +124,14 @@ func tryRefreshModels(ctx context.Context, label string) {
 		log.Warnf("%s: fetch failed from all URLs, keeping current data", label)
 		return
 	}
+	if oldData != nil {
+		if len(parsed.Devin) == 0 {
+			parsed.Devin = oldData.Devin
+		}
+		if len(parsed.Meta) == 0 {
+			parsed.Meta = oldData.Meta
+		}
+	}
 
 	// Detect changes before updating store.
 	changed := detectChangedProviders(oldData, parsed)
@@ -225,6 +233,8 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 		{"kimi", oldData.Kimi, newData.Kimi},
 		{"antigravity", oldData.Antigravity, newData.Antigravity},
 		{"xai", oldData.XAI, newData.XAI},
+		{"devin", oldData.Devin, newData.Devin},
+		{"meta", oldData.Meta, newData.Meta},
 	}
 
 	seen := make(map[string]bool, len(sections))
@@ -354,6 +364,20 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 	}
 
 	for _, section := range requiredSections {
+		if err := validateModelSection(section.name, section.models); err != nil {
+			return err
+		}
+	}
+	for _, section := range []struct {
+		name   string
+		models []*ModelInfo
+	}{
+		{name: "devin", models: data.Devin},
+		{name: "meta", models: data.Meta},
+	} {
+		if len(section.models) == 0 {
+			continue
+		}
 		if err := validateModelSection(section.name, section.models); err != nil {
 			return err
 		}

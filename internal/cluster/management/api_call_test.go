@@ -67,3 +67,29 @@ func TestAPICallTransportUsesOAuthMetadataProxyURL(t *testing.T) {
 		t.Fatalf("proxy URL = %v, want http://codex-proxy.example.com:8080", proxyURL)
 	}
 }
+
+func TestAPICallTokenValueUsesDevinSessionMetadata(t *testing.T) {
+	auth := &coreauth.Auth{
+		Provider: "devin",
+		Metadata: map[string]any{
+			"type":          "devin",
+			"auth_kind":     "oauth",
+			"api_key":       "devin-session-token$secret",
+			"session_token": "devin-session-token$secret",
+		},
+	}
+	if got := apiCallTokenValueForAuth(auth); got != "devin-session-token$secret" {
+		t.Fatalf("apiCallTokenValueForAuth() = %q, want Devin session token", got)
+	}
+
+	accessFirst := &coreauth.Auth{
+		Provider: "meta",
+		Metadata: map[string]any{
+			"access_token": "LLM|preferred",
+			"api_key":      "LLM|secondary",
+		},
+	}
+	if got := apiCallTokenValueForAuth(accessFirst); got != "LLM|preferred" {
+		t.Fatalf("apiCallTokenValueForAuth() = %q, want access_token first", got)
+	}
+}

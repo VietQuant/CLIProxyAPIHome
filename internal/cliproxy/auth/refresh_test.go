@@ -2,9 +2,11 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -1743,5 +1745,81 @@ func TestApplyRefreshSuccessStatePreservesLegacyCredentialQuotaAfterUnauthorized
 	}
 	if auth.LastError == nil || auth.LastError.HTTPStatus != http.StatusTooManyRequests || auth.LastError.Message != auth.Quota.Reason {
 		t.Fatalf("credential error = %#v, want reconstructed quota error", auth.LastError)
+	}
+}
+
+func TestAuthSupportsBuiltInRefreshMetaUsesDCAToken(t *testing.T) {
+	if authSupportsBuiltInRefresh(&Auth{Provider: "meta", Metadata: map[string]any{"access_token": "LLM|key"}}) {
+		t.Fatal("Meta without DCA token should not advertise built-in refresh")
+	}
+	auth := &Auth{
+		Provider: "meta",
+		Metadata: map[string]any{
+			"access_token": "dca:login-token",
+			"dca_token":    "dca:login-token",
+			"expired":      time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+	if !authSupportsBuiltInRefresh(auth) {
+		t.Fatal("Meta with dca_token should advertise built-in refresh")
+	}
+}
+
+func TestRefreshMetaMintsAPIKeyFromDCAToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer dca:login-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"api_key":        "LLM|minted-key",
+			"base_url":       "https://api.meta.ai/v1",
+			"user_email":     "user@example.com",
+			"user_full_name": "Meta User",
+		})
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("META_MINT_URL", server.URL)
+
+	auth := &Auth{
+		ID:       "meta-dca-auth",
+		Provider: "meta",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"type":         "meta",
+			"auth_kind":    "oauth",
+			"access_token": "dca:login-token",
+			"dca_token":    "dca:login-token",
+			"expired":      time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+	updated, errRefresh := refreshCredential(context.Background(), nil, auth, nil)
+	if errRefresh != nil {
+		t.Fatalf("refreshCredential() error = %v", errRefresh)
+	}
+	if updated.Metadata["api_key"] != "LLM|minted-key" || updated.Metadata["access_token"] != "LLM|minted-key" {
+		t.Fatalf("minted metadata = %#v", updated.Metadata)
+	}
+	if _, exists := updated.Metadata["expired"]; exists {
+		t.Fatalf("expired still present after mint: %#v", updated.Metadata["expired"])
+	}
+	if updated.Attributes["api_key"] != "LLM|minted-key" || updated.Attributes["dca_token"] != "dca:login-token" {
+		t.Fatalf("minted attributes = %#v", updated.Attributes)
+	}
+}
+
+func TestRefreshMetaNoopsWithoutDCAToken(t *testing.T) {
+	auth := &Auth{
+		Provider: "meta",
+		Metadata: map[string]any{
+			"api_key":      "LLM|existing",
+			"access_token": "LLM|existing",
+		},
+	}
+	updated, errRefresh := refreshCredential(context.Background(), nil, auth, nil)
+	if errRefresh != nil {
+		t.Fatalf("refreshCredential() error = %v", errRefresh)
+	}
+	if updated.Metadata["api_key"] != "LLM|existing" {
+		t.Fatalf("API-key-only Meta refresh mutated metadata: %#v", updated.Metadata)
 	}
 }

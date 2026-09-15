@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -1542,5 +1544,79 @@ func TestRefreshControllerStandbyUnsupportedMasterErrorClearsOldBlockWhenSyncFai
 	}
 	if standbyAuth.LastRefreshError == nil || standbyAuth.LastRefreshError.Code != "refresh_unsupported" {
 		t.Fatalf("standby LastRefreshError = %#v, want refresh_unsupported", standbyAuth.LastRefreshError)
+	}
+}
+
+func TestRefreshNowObservedRecoversMetaAfterFailedMint(t *testing.T) {
+	const authID = "meta-dca-failed-mint"
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer dca:login-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"api_key":        "LLM|recovered-key",
+			"base_url":       "https://api.meta.ai/v1",
+			"user_email":     "user@example.com",
+			"user_full_name": "Meta User",
+		})
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("META_MINT_URL", server.URL)
+
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "meta",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"type":         "meta",
+			"auth_kind":    "oauth",
+			"access_token": "dca:login-token",
+			"dca_token":    "dca:login-token",
+			"expired":      time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+	repo := newRefreshTestRepository(t)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	runtime := newRefreshTestRuntime(t, repo, auth, nil)
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9317, Secret: "master-secret"}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, coordinator)
+	controller := NewRefreshController(coordinator, runtime, repo, nil)
+
+	payload, errRefresh := controller.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth))
+	if errRefresh != nil {
+		t.Fatalf("RefreshNowObserved() error = %v", errRefresh)
+	}
+
+	var envelope struct {
+		Auth coreauth.Auth `json:"auth"`
+	}
+	if errDecode := json.Unmarshal(payload, &envelope); errDecode != nil {
+		t.Fatalf("decode refresh payload: %v body=%s", errDecode, payload)
+	}
+	if envelope.Auth.Metadata["api_key"] != "LLM|recovered-key" || envelope.Auth.Metadata["access_token"] != "LLM|recovered-key" {
+		t.Fatalf("refresh payload metadata = %#v", envelope.Auth.Metadata)
+	}
+	if _, exists := envelope.Auth.Metadata["expired"]; exists {
+		t.Fatalf("refresh payload still has expired: %#v", envelope.Auth.Metadata["expired"])
+	}
+
+	persisted, _, errAuth := repo.GetAuth(ctx, authID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if persisted.Metadata["api_key"] != "LLM|recovered-key" || persisted.Metadata["dca_token"] != "dca:login-token" {
+		t.Fatalf("persisted metadata = %#v", persisted.Metadata)
+	}
+	if _, exists := persisted.Metadata["expired"]; exists {
+		t.Fatalf("persisted expired still present: %#v", persisted.Metadata["expired"])
+	}
+	inMemory, ok := runtime.CoreManager().GetByID(authID)
+	if !ok || inMemory.Metadata["api_key"] != "LLM|recovered-key" {
+		t.Fatalf("in-memory metadata = %#v", inMemory)
 	}
 }

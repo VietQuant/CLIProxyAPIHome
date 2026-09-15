@@ -668,6 +668,7 @@ var providerCredentialConfigKeys = []string{
 	"vertex-api-key",
 	"codex-api-key",
 	"xai-api-key",
+	"meta-api-key",
 	"claude-api-key",
 	"openai-compatibility",
 }

@@ -145,6 +145,7 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 		"interactions-api-key",
 		"codex-api-key",
 		"xai-api-key",
+		"meta-api-key",
 		"claude-api-key",
 		"openai-compatibility",
 		"vertex-api-key",

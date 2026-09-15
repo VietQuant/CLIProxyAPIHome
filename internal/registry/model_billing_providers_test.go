@@ -58,6 +58,9 @@ func TestStaticModelDefinitionsExposeCanonicalBillingProviders(t *testing.T) {
 		{channel: "xai", provider: "xai"},
 		{channel: "x-ai", provider: "xai"},
 		{channel: "grok", provider: "xai"},
+		{channel: "devin", provider: "devin"},
+		{channel: "meta", provider: "meta"},
+		{channel: "muse", provider: "meta"},
 	}
 
 	for _, test := range tests {

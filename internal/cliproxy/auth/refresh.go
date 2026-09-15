@@ -15,6 +15,7 @@ import (
 	claudeauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/claude"
 	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
 	kimiauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/kimi"
+	metaauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/meta"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/oautherror"
 	xaiauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
@@ -22,7 +23,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// refreshCredential refreshes auth metadata when a refresh token is present.
+// refreshCredential refreshes auth metadata when a refresh token or Meta DCA token is present.
 // It is best-effort: providers that do not support refresh are treated as no-op.
 func refreshCredential(ctx context.Context, cfg *config.Config, auth *Auth, rt http.RoundTripper) (*Auth, error) {
 	// Resolve credential context before calling upstream OAuth services.
@@ -45,6 +46,8 @@ func refreshCredential(ctx context.Context, cfg *config.Config, auth *Auth, rt h
 		return refreshAntigravity(ctx, cfg, auth, rt)
 	case "xai":
 		return refreshXAI(ctx, cfg, auth)
+	case "meta":
+		return refreshMeta(ctx, cfg, auth)
 	default:
 		return auth, nil
 	}
@@ -385,6 +388,82 @@ func refreshXAI(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, err
 	auth.Metadata["auth_kind"] = "oauth"
 	auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
 	return auth, nil
+}
+
+// refreshMeta mints an LLM API key from a Meta DCA token.
+func refreshMeta(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, error) {
+	dcaToken := extractMetaDCAToken(auth)
+	if dcaToken == "" {
+		return auth, nil
+	}
+	svc := metaauth.NewMetaAuthWithProxyURL(cfg, auth.ProxyURL)
+	minted, errMint := svc.MintAPIKey(ctx, dcaToken)
+	if errMint != nil {
+		return nil, errMint
+	}
+	if minted == nil || strings.TrimSpace(minted.APIKey) == "" {
+		return nil, fmt.Errorf("meta refresh: mint API key returned empty key")
+	}
+
+	baseURL := metaStringValue(auth.Metadata, "base_url")
+	if baseURL == "" && auth.Attributes != nil {
+		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	if mintedURL := strings.TrimSpace(minted.BaseURL); mintedURL != "" {
+		baseURL = mintedURL
+	}
+	if baseURL == "" {
+		baseURL = metaauth.DefaultAPIBaseURL
+	}
+
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["base_url"] = baseURL
+	auth.Metadata["api_key"] = minted.APIKey
+	auth.Metadata["access_token"] = minted.APIKey
+	auth.Metadata["dca_token"] = dcaToken
+	delete(auth.Metadata, "expired")
+	if minted.UserEmail != "" {
+		auth.Metadata["email"] = minted.UserEmail
+	}
+	if minted.UserFullName != "" {
+		auth.Metadata["name"] = minted.UserFullName
+	}
+	auth.Metadata["type"] = "meta"
+	auth.Metadata["auth_kind"] = "oauth"
+	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
+
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes["base_url"] = baseURL
+	auth.Attributes["api_key"] = minted.APIKey
+	auth.Attributes["access_token"] = minted.APIKey
+	auth.Attributes["dca_token"] = dcaToken
+	auth.Attributes["auth_kind"] = "oauth"
+	return auth, nil
+}
+
+func extractMetaDCAToken(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if dca := strings.TrimSpace(auth.Attributes["dca_token"]); dca != "" {
+			return dca
+		}
+		if access := strings.TrimSpace(auth.Attributes["access_token"]); strings.HasPrefix(access, "dca:") {
+			return access
+		}
+	}
+	if dca := metaStringValue(auth.Metadata, "dca_token"); dca != "" {
+		return dca
+	}
+	if access := metaStringValue(auth.Metadata, "access_token"); strings.HasPrefix(access, "dca:") {
+		return access
+	}
+	return ""
 }
 
 // metaStringValue handles a meta string value.

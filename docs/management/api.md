@@ -193,6 +193,7 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/debug` |
 | `PATCH` | `/debug` |
 | `PUT` | `/debug` |
+| `GET` | `/devin-auth-url` |
 | `GET` | `/error-logs-max-files` |
 | `PATCH` | `/error-logs-max-files` |
 | `PUT` | `/error-logs-max-files` |
@@ -224,6 +225,11 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/max-retry-interval` |
 | `PATCH` | `/max-retry-interval` |
 | `PUT` | `/max-retry-interval` |
+| `DELETE` | `/meta-api-key` |
+| `GET` | `/meta-api-key` |
+| `PATCH` | `/meta-api-key` |
+| `PUT` | `/meta-api-key` |
+| `GET` | `/meta-auth-url` |
 | `GET` | `/model-definitions/:channel` |
 | `GET` | `/model-group-details` |
 | `POST` | `/model-group-details` |
@@ -379,6 +385,7 @@ Example response:
   "interactions-api-key": [],
   "codex-api-key": [],
   "xai-api-key": [],
+  "meta-api-key": [],
   "codex-header-defaults": {
     "user-agent": "",
     "beta-features": ""
@@ -459,6 +466,7 @@ interactions-api-key
 vertex-api-key
 codex-api-key
 xai-api-key
+meta-api-key
 claude-api-key
 openai-compatibility
 ```
@@ -2097,6 +2105,11 @@ PUT    /xai-api-key
 PATCH  /xai-api-key
 DELETE /xai-api-key
 
+GET    /meta-api-key
+PUT    /meta-api-key
+PATCH  /meta-api-key
+DELETE /meta-api-key
+
 GET    /vertex-api-key
 PUT    /vertex-api-key
 PATCH  /vertex-api-key
@@ -2575,6 +2588,8 @@ GET /codex-auth-url
 GET /antigravity-auth-url
 GET /kimi-auth-url
 GET /xai-auth-url
+GET /devin-auth-url
+GET /meta-auth-url
 GET /<plugin-provider>-auth-url
 ```
 
@@ -2588,7 +2603,7 @@ Common response:
 }
 ```
 
-`GET /kimi-auth-url` starts a device flow and returns the verification URL. Completion is handled by Home in the background.
+`GET /kimi-auth-url` and `GET /meta-auth-url` start a device flow and return the verification URL. Completion is handled by Home in the background. `GET /meta-auth-url` also returns `user_code` when the upstream device-flow response includes one. If Meta omits `verification_uri_complete`, clients must open `url` and enter `user_code`.
 
 `GET /<plugin-provider>-auth-url` is available for Home-loaded plugin providers returned by `GET /plugins` with `supports_oauth: true`, `effective_enabled: true`, and a non-empty `oauth_provider`. The provider segment is normalized to lowercase and must contain only letters, numbers, or hyphens.
 
@@ -4191,6 +4206,7 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | `interactions-api-key` | array of `GeminiKey` | Native Google Interactions API-key credentials; use provider-key routes. |
 | `codex-api-key` | array of `CodexKey` | Codex API-key credentials; use provider-key routes. |
 | `xai-api-key` | array of `XAIKey` | Native xAI API-key credentials; use provider-key routes. |
+| `meta-api-key` | array of `MetaKey` | Native Meta Muse API-key credentials; use provider-key routes. |
 | `codex-header-defaults.user-agent` | string | Default Codex User-Agent. |
 | `codex-header-defaults.beta-features` | string | Default Codex websocket beta features header. |
 | `claude-api-key` | array of `ClaudeKey` | Claude API-key credentials; use provider-key routes. |

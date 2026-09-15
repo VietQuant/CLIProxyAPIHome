@@ -21,6 +21,7 @@ type CredentialConfigCounts struct {
 	VertexKeys          int
 	CodexKeys           int
 	XAIKeys             int
+	MetaKeys            int
 	ClaudeKeys          int
 	OpenAICompatibility int
 }
@@ -58,6 +59,7 @@ func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, re
 	vertexKeys := make([]appconfig.VertexCompatKey, 0)
 	codexKeys := make([]appconfig.CodexKey, 0)
 	xaiKeys := make([]appconfig.XAIKey, 0)
+	metaKeys := make([]appconfig.MetaKey, 0)
 	claudeKeys := make([]appconfig.ClaudeKey, 0)
 	openAICompat := make(map[string]*credentialOpenAICompatGroup)
 
@@ -73,6 +75,8 @@ func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, re
 			codexKeys = append(codexKeys, credentialCodexKey(auth))
 		case "xai-api-key":
 			xaiKeys = append(xaiKeys, credentialXAIKey(auth))
+		case "meta-api-key":
+			metaKeys = append(metaKeys, credentialMetaKey(auth))
 		case "claude-api-key":
 			claudeKeys = append(claudeKeys, credentialClaudeKey(auth))
 		case "openai-compatibility":
@@ -99,6 +103,10 @@ func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, re
 	if len(xaiKeys) > 0 {
 		root["xai-api-key"] = xaiKeys
 		result.XAIKeys = len(xaiKeys)
+	}
+	if len(metaKeys) > 0 {
+		root["meta-api-key"] = metaKeys
+		result.MetaKeys = len(metaKeys)
 	}
 	if len(claudeKeys) > 0 {
 		root["claude-api-key"] = claudeKeys
@@ -141,6 +149,8 @@ func credentialConfigAuthKind(auth *coreauth.Auth) string {
 		return "codex-api-key"
 	case auth.Provider == "xai" && strings.HasPrefix(source, "config:xai["):
 		return "xai-api-key"
+	case auth.Provider == "meta" && strings.HasPrefix(source, "config:meta["):
+		return "meta-api-key"
 	case auth.Provider == "claude" && strings.HasPrefix(source, "config:claude["):
 		return "claude-api-key"
 	case isOpenAICompatConfigAuth(auth):
@@ -226,6 +236,24 @@ func credentialXAIKey(auth *coreauth.Auth) appconfig.XAIKey {
 		Websockets:     strings.EqualFold(authAttribute(auth, "websockets"), "true"),
 		ProxyURL:       strings.TrimSpace(auth.ProxyURL),
 		Models:         credentialXAIModels(auth),
+		Headers:        credentialHeaders(auth),
+		ExcludedModels: credentialExcludedModels(auth),
+		DisableCooling: credentialDisableCooling(auth),
+		RequestRetry:   credentialRequestRetry(auth),
+	}
+}
+
+// credentialMetaKey builds a Meta key config from an auth record.
+func credentialMetaKey(auth *coreauth.Auth) appconfig.MetaKey {
+	return appconfig.MetaKey{
+		ID:             strings.TrimSpace(auth.ID),
+		APIKey:         authAttribute(auth, "api_key"),
+		Priority:       credentialPriority(auth),
+		Prefix:         strings.TrimSpace(auth.Prefix),
+		BaseURL:        authAttribute(auth, "base_url"),
+		Websockets:     strings.EqualFold(authAttribute(auth, "websockets"), "true"),
+		ProxyURL:       strings.TrimSpace(auth.ProxyURL),
+		Models:         credentialMetaModels(auth),
 		Headers:        credentialHeaders(auth),
 		ExcludedModels: credentialExcludedModels(auth),
 		DisableCooling: credentialDisableCooling(auth),
@@ -375,6 +403,21 @@ func credentialXAIModels(auth *coreauth.Auth) []appconfig.XAIModel {
 	out := make([]appconfig.XAIModel, 0, len(pairs))
 	for _, pair := range pairs {
 		out = append(out, appconfig.XAIModel{
+			Name:         pair.Name,
+			Alias:        pair.Alias,
+			DisplayName:  pair.DisplayName,
+			ForceMapping: pair.ForceMapping,
+		})
+	}
+	return out
+}
+
+// credentialMetaModels builds Meta model config from stored model metadata.
+func credentialMetaModels(auth *coreauth.Auth) []appconfig.MetaModel {
+	pairs := credentialModelPairs(auth)
+	out := make([]appconfig.MetaModel, 0, len(pairs))
+	for _, pair := range pairs {
+		out = append(out, appconfig.MetaModel{
 			Name:         pair.Name,
 			Alias:        pair.Alias,
 			DisplayName:  pair.DisplayName,
