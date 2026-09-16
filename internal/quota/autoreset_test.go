@@ -30,7 +30,7 @@ func TestDecideSkipsCredentialWithoutCredits(t *testing.T) {
 	item := &cluster.QuotaCredentialSnapshot{
 		Windows: []cluster.QuotaWindow{{RemainingRatio: floatPtr(0)}},
 	}
-	if _, ok := a.decide(item, now); ok {
+	if _, ok := a.decide(item, a.currentOptions(), now); ok {
 		t.Fatal("decide() spent a credit on a credential that has none")
 	}
 }
@@ -45,7 +45,7 @@ func TestDecideRuleAExhausted(t *testing.T) {
 			ResetAt:        timePtr(now.Add(72 * time.Hour)),
 		}},
 	}
-	reason, ok := a.decide(item, now)
+	reason, ok := a.decide(item, a.currentOptions(), now)
 	if !ok || reason != "quota_exhausted" {
 		t.Fatalf("decide() = %q, %v; want quota_exhausted, true", reason, ok)
 	}
@@ -62,7 +62,7 @@ func TestDecideRuleASkipsImminentNaturalReset(t *testing.T) {
 			ResetAt:        timePtr(now.Add(2 * time.Hour)),
 		}},
 	}
-	if _, ok := a.decide(item, now); ok {
+	if _, ok := a.decide(item, a.currentOptions(), now); ok {
 		t.Fatal("decide() spent a credit on a window that resets within the day")
 	}
 }
@@ -77,7 +77,7 @@ func TestDecideRuleASkipsHealthyWindow(t *testing.T) {
 			ResetAt:        timePtr(now.Add(72 * time.Hour)),
 		}},
 	}
-	if _, ok := a.decide(item, now); ok {
+	if _, ok := a.decide(item, a.currentOptions(), now); ok {
 		t.Fatal("decide() spent a credit on a window with quota remaining")
 	}
 }
@@ -91,7 +91,7 @@ func TestDecideRuleBFiresRegardlessOfQuota(t *testing.T) {
 		ResetCredits: creditsWithExpiry(timePtr(now.Add(time.Hour))),
 		Windows:      []cluster.QuotaWindow{{RemainingRatio: floatPtr(1)}},
 	}
-	reason, ok := a.decide(item, now)
+	reason, ok := a.decide(item, a.currentOptions(), now)
 	if !ok {
 		t.Fatal("decide() did not rescue a credit expiring within the window")
 	}
@@ -107,7 +107,7 @@ func TestDecideRuleBSkipsDistantExpiry(t *testing.T) {
 		ResetCredits: creditsWithExpiry(timePtr(now.Add(72 * time.Hour))),
 		Windows:      []cluster.QuotaWindow{{RemainingRatio: floatPtr(1)}},
 	}
-	if _, ok := a.decide(item, now); ok {
+	if _, ok := a.decide(item, a.currentOptions(), now); ok {
 		t.Fatal("decide() spent a credit that expires days from now")
 	}
 }
@@ -123,7 +123,7 @@ func TestDecideRespectsDisabledRules(t *testing.T) {
 			ResetAt:        timePtr(now.Add(72 * time.Hour)),
 		}},
 	}
-	if _, ok := a.decide(item, now); ok {
+	if _, ok := a.decide(item, a.currentOptions(), now); ok {
 		t.Fatal("decide() spent a credit while both rules were disabled")
 	}
 }
@@ -162,7 +162,7 @@ func TestDecideIgnoresUnlimitedWindow(t *testing.T) {
 		ResetCredits: creditsWithExpiry(nil),
 		Windows:      []cluster.QuotaWindow{{IsUnlimited: true, RemainingRatio: floatPtr(0)}},
 	}
-	if _, ok := a.decide(item, now); ok {
+	if _, ok := a.decide(item, a.currentOptions(), now); ok {
 		t.Fatal("decide() spent a credit on an unlimited window")
 	}
 }

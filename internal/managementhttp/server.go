@@ -221,6 +221,8 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodGet, "/quota/credentials", handler.ListQuotaCredentials)
 	r.Set(http.MethodGet, "/quota/credentials/:credential_id", handler.GetQuotaCredential)
 	r.Set(http.MethodPost, "/quota/collect", handler.CollectQuota)
+	r.Set(http.MethodGet, "/quota/auto-reset-config", handler.GetQuotaAutoResetConfig)
+	r.Set(http.MethodPut, "/quota/auto-reset-config", handler.UpdateQuotaAutoResetConfig)
 	r.Set(http.MethodGet, "/usage/overview", handler.GetUsageOverview)
 	r.Set(http.MethodGet, "/usage/records", handler.ListUsageRecords)
 	r.Set(http.MethodGet, "/usage/session-tree", handler.GetSessionTree)

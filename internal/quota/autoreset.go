@@ -89,9 +89,14 @@ func (o *AutoResetOptions) applyDefaults() {
 // AutoReset spends provider reset credits on a schedule. It borrows the collector's
 // HTTP path (proxy config, token resolution, response limits) rather than building a
 // second one, so a credential that can be probed can also be reset.
+//
+// Settings live in the database and are re-read every tick, so a change made from the
+// console takes effect without restarting Home.
 type AutoReset struct {
 	repo      *cluster.Repository
 	collector *Collector
+
+	optionsMu sync.RWMutex
 	options   AutoResetOptions
 
 	background sync.WaitGroup
@@ -105,8 +110,47 @@ func NewAutoReset(repo *cluster.Repository, collector *Collector, options AutoRe
 	return &AutoReset{repo: repo, collector: collector, options: options}
 }
 
+// currentOptions returns the settings snapshot the current tick should use.
+func (a *AutoReset) currentOptions() AutoResetOptions {
+	a.optionsMu.RLock()
+	defer a.optionsMu.RUnlock()
+	return a.options
+}
+
+// refreshOptions reloads the stored settings. A read failure leaves the previous
+// snapshot in place and is logged: continuing with the last known-good settings is
+// safer than falling back to defaults, which would silently change spend behavior.
+func (a *AutoReset) refreshOptions(ctx context.Context) AutoResetOptions {
+	record, errGet := a.repo.GetQuotaAutoResetConfig(ctx)
+	if errGet != nil {
+		log.WithError(errGet).Warn("quota auto reset: config read failed, keeping previous settings")
+		return a.currentOptions()
+	}
+	spendInterval, collectInterval, expiryWindow, errDurations := record.Durations()
+	if errDurations != nil {
+		log.WithError(errDurations).Warn("quota auto reset: stored config is invalid, keeping previous settings")
+		return a.currentOptions()
+	}
+	options := AutoResetOptions{
+		Enabled:          record.Enabled,
+		SpendInterval:    spendInterval,
+		CollectInterval:  collectInterval,
+		RuleAEnabled:     record.RuleAEnabled,
+		ThresholdPercent: record.ThresholdPercent,
+		WithinDays:       record.WithinDays,
+		RuleBEnabled:     record.RuleBEnabled,
+		ExpiryWindow:     expiryWindow,
+		Now:              a.currentOptions().Now,
+	}
+	options.applyDefaults()
+	a.optionsMu.Lock()
+	a.options = options
+	a.optionsMu.Unlock()
+	return options
+}
+
 func (a *AutoReset) Start(ctx context.Context) {
-	if a == nil || !a.options.Enabled {
+	if a == nil {
 		return
 	}
 	if ctx == nil {
@@ -115,21 +159,13 @@ func (a *AutoReset) Start(ctx context.Context) {
 	a.background.Add(2)
 	go func() {
 		defer a.background.Done()
-		a.loop(ctx, a.options.SpendInterval, a.runSpend)
+		a.loop(ctx, func(o AutoResetOptions) time.Duration { return o.SpendInterval }, a.runSpend)
 	}()
 	go func() {
 		defer a.background.Done()
-		a.loop(ctx, a.options.CollectInterval, a.runCollect)
+		a.loop(ctx, func(o AutoResetOptions) time.Duration { return o.CollectInterval }, a.runCollect)
 	}()
-	log.WithFields(log.Fields{
-		"spend_interval":    a.options.SpendInterval,
-		"collect_interval":  a.options.CollectInterval,
-		"rule_a":            a.options.RuleAEnabled,
-		"rule_a_threshold":  a.options.ThresholdPercent,
-		"rule_a_within_day": a.options.WithinDays,
-		"rule_b":            a.options.RuleBEnabled,
-		"rule_b_window":     a.options.ExpiryWindow,
-	}).Info("quota auto reset started")
+	log.Info("quota auto reset started")
 }
 
 // Wait blocks until both loops have exited. Primarily for deterministic tests.
@@ -140,16 +176,21 @@ func (a *AutoReset) Wait() {
 	a.background.Wait()
 }
 
-func (a *AutoReset) loop(ctx context.Context, interval time.Duration, fn func(context.Context)) {
-	fn(ctx)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+// loop re-reads the settings before each tick and re-arms the timer with the interval
+// they specify, so an interval edited in the console applies from the next tick rather
+// than at the next restart.
+func (a *AutoReset) loop(ctx context.Context, interval func(AutoResetOptions) time.Duration, fn func(context.Context, AutoResetOptions)) {
 	for {
+		options := a.refreshOptions(ctx)
+		if options.Enabled {
+			fn(ctx, options)
+		}
+		timer := time.NewTimer(interval(options))
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			fn(ctx)
+		case <-timer.C:
 		}
 	}
 }
@@ -161,7 +202,7 @@ func (a *AutoReset) loop(ctx context.Context, interval time.Duration, fn func(co
 // receiving requests, so it stops being probed, and its snapshot — including the
 // expiry timestamps rule B reads — freezes at whatever it was when traffic stopped.
 // Forcing a round bypasses that gate.
-func (a *AutoReset) runCollect(ctx context.Context) {
+func (a *AutoReset) runCollect(ctx context.Context, _ AutoResetOptions) {
 	accepted, errTrigger := a.collector.TriggerCollection(ctx, nil, nil)
 	if errTrigger != nil {
 		log.WithError(errTrigger).Warn("quota auto reset: forced collection failed")
@@ -170,11 +211,11 @@ func (a *AutoReset) runCollect(ctx context.Context) {
 	log.WithField("accepted", accepted).Debug("quota auto reset: forced collection queued")
 }
 
-func (a *AutoReset) runSpend(ctx context.Context) {
-	if !a.options.RuleAEnabled && !a.options.RuleBEnabled {
+func (a *AutoReset) runSpend(ctx context.Context, options AutoResetOptions) {
+	if !options.RuleAEnabled && !options.RuleBEnabled {
 		return
 	}
-	now := a.options.Now().UTC()
+	now := options.Now().UTC()
 	result, errList := a.repo.ListQuotaCredentials(ctx, cluster.QuotaListQuery{Now: now})
 	if errList != nil {
 		log.WithError(errList).Warn("quota auto reset: list credentials failed")
@@ -182,7 +223,7 @@ func (a *AutoReset) runSpend(ctx context.Context) {
 	}
 	for i := range result.Items {
 		item := result.Items[i]
-		reason, ok := a.decide(&item, now)
+		reason, ok := a.decide(&item, options, now)
 		if !ok {
 			continue
 		}
@@ -194,24 +235,24 @@ func (a *AutoReset) runSpend(ctx context.Context) {
 // none of the enabled rules apply. Rule B is checked first: a credit that is about
 // to expire is lost whether or not the quota needs it, so rescuing it strictly
 // dominates holding it back.
-func (a *AutoReset) decide(item *cluster.QuotaCredentialSnapshot, now time.Time) (string, bool) {
+func (a *AutoReset) decide(item *cluster.QuotaCredentialSnapshot, options AutoResetOptions, now time.Time) (string, bool) {
 	if item.ResetCredits == nil || len(item.ResetCredits.Credits) == 0 {
 		return "", false
 	}
-	if a.options.RuleBEnabled {
+	if options.RuleBEnabled {
 		// Credits are stored sorted by expiry, nulls last, so the first dated credit
 		// is the soonest to expire.
 		for _, credit := range item.ResetCredits.Credits {
 			if credit.ExpiresAt == nil {
 				continue
 			}
-			if !credit.ExpiresAt.After(now.Add(a.options.ExpiryWindow)) {
+			if !credit.ExpiresAt.After(now.Add(options.ExpiryWindow)) {
 				return fmt.Sprintf("credit_expiring_at_%s", credit.ExpiresAt.UTC().Format(time.RFC3339)), true
 			}
 			break
 		}
 	}
-	if a.options.RuleAEnabled && a.exhausted(item, now) {
+	if options.RuleAEnabled && a.exhausted(item, options, now) {
 		return "quota_exhausted", true
 	}
 	return "", false
@@ -219,14 +260,14 @@ func (a *AutoReset) decide(item *cluster.QuotaCredentialSnapshot, now time.Time)
 
 // exhausted reports whether any window is at or below the configured remaining
 // threshold and is far enough from its natural reset to be worth a credit.
-func (a *AutoReset) exhausted(item *cluster.QuotaCredentialSnapshot, now time.Time) bool {
-	horizon := now.Add(time.Duration(a.options.WithinDays * float64(24*time.Hour)))
+func (a *AutoReset) exhausted(item *cluster.QuotaCredentialSnapshot, options AutoResetOptions, now time.Time) bool {
+	horizon := now.Add(time.Duration(options.WithinDays * float64(24*time.Hour)))
 	for _, window := range item.Windows {
 		if window.IsUnlimited {
 			continue
 		}
 		remaining, ok := remainingPercent(window)
-		if !ok || remaining > a.options.ThresholdPercent {
+		if !ok || remaining > options.ThresholdPercent {
 			continue
 		}
 		// A window that resets on its own shortly is not worth an irreversible credit.

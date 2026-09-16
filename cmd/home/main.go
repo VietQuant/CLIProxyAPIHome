@@ -420,7 +420,7 @@ func run() int {
 		},
 	})
 	quotaCollector.Start(runCtx)
-	startQuotaAutoReset(runCtx, repo, quotaCollector, cfg)
+	startQuotaAutoReset(runCtx, repo, quotaCollector)
 
 	respSrv = respserver.New(addr, rt)
 	respSrv.SetClusterHandler(clusterRESPHandler)
@@ -937,27 +937,10 @@ func applyLogLevel(cfg *config.Config) {
 	}
 }
 
-// startQuotaAutoReset wires the quota auto reset loops when enabled in config.
-// Misconfiguration is logged and skipped rather than fatal: a bad duration should
-// not stop Home from serving traffic, and the feature is opt-in to begin with.
-func startQuotaAutoReset(ctx context.Context, repo *cluster.Repository, collector *quotacollector.Collector, cfg *config.Config) {
-	if cfg == nil || !cfg.QuotaAutoReset.Enabled {
-		return
-	}
-	spendInterval, collectInterval, expiryWindow, errDurations := cfg.QuotaAutoReset.Durations()
-	if errDurations != nil {
-		log.Errorf("quota auto reset disabled: %v", errDurations)
-		return
-	}
-	autoReset := quotacollector.NewAutoReset(repo, collector, quotacollector.AutoResetOptions{
-		Enabled:          true,
-		SpendInterval:    spendInterval,
-		CollectInterval:  collectInterval,
-		RuleAEnabled:     cfg.QuotaAutoReset.RuleAEnabled,
-		ThresholdPercent: cfg.QuotaAutoReset.ThresholdPercent,
-		WithinDays:       cfg.QuotaAutoReset.WithinDays,
-		RuleBEnabled:     cfg.QuotaAutoReset.RuleBEnabled,
-		ExpiryWindow:     expiryWindow,
-	})
+// startQuotaAutoReset wires the quota auto reset loops. The loops always start but
+// stay idle until the stored configuration enables them, so a change made from the
+// console takes effect without restarting Home.
+func startQuotaAutoReset(ctx context.Context, repo *cluster.Repository, collector *quotacollector.Collector) {
+	autoReset := quotacollector.NewAutoReset(repo, collector, quotacollector.AutoResetOptions{})
 	autoReset.Start(ctx)
 }

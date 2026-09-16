@@ -64,9 +64,6 @@ type Config struct {
 	// CredentialInFlight configures credential observation snapshots.
 	CredentialInFlight CredentialInFlightConfig `yaml:"credential-in-flight" json:"credential-in-flight"`
 
-	// QuotaAutoReset configures automatic spending of quota reset credits.
-	QuotaAutoReset QuotaAutoResetConfig `yaml:"quota-auto-reset" json:"quota-auto-reset"`
-
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
 
@@ -765,7 +762,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.CredentialConcurrency = DefaultCredentialConcurrencyConfig()
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
-	cfg.QuotaAutoReset = DefaultQuotaAutoResetConfig()
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return credential defaults instead of error.
@@ -775,9 +771,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
-		return nil, errValidate
-	}
-	if errValidate := cfg.QuotaAutoReset.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
 	if errValidate := ValidateCredentialConcurrencyConfig(cfg.CredentialConcurrency); errValidate != nil {
