@@ -64,3 +64,23 @@ go build -o test-output ./cmd/home && rm test-output # Verify compile after Go c
 - Avoid panics in HTTP handlers; prefer logged errors and meaningful HTTP status codes.
 - Keep network timeout behavior consistent with the existing runtime. Do not add broad upstream timeouts after an upstream connection is established unless the existing code path already has an intentional exception.
 - Avoid wall-clock `time.Sleep` in TTL, expiration, ordering, or cache-eviction unit tests due to platform timer granularity (e.g. Windows default timer resolution of ~15.6ms) and CI jitter under load; prefer controllable clocks (`nowFunc` / mock clock), explicit timestamp manipulation, or deterministic synchronization primitives.
+
+## Fork VietQuant — đọc guide chung trước
+
+Repo này là **một phần của stack `cliproxy`**, không đứng riêng. Một thay đổi thường chạm
+2–3 repo cùng lúc (Home BE + console UI + gitops values).
+
+**Kiến thức của stack nằm ở `../AGENTS.md`** — đọc nó trước khi làm việc ở đây:
+
+| File | Đọc khi |
+|---|---|
+| [../AGENTS.md](../AGENTS.md) | luôn luôn — repo nào làm gì, môi trường office, việc đã/chưa làm |
+| [../docs/01-quota-auto-reset.md](../docs/01-quota-auto-reset.md) | làm gì liên quan quota auto reset |
+| [../docs/02-build-and-deploy.md](../docs/02-build-and-deploy.md) | dựng image hoặc deploy |
+| [../docs/03-gotchas.md](../docs/03-gotchas.md) | **trước khi debug bất cứ thứ gì** |
+
+`origin` là fork VietQuant; `upstream` là `router-for-me/*` và **push đã bị chặn** —
+không mở PR lên upstream.
+
+Luật cập nhật guide nằm trong `../AGENTS.md`. Ghi lesson vào `../docs/`, không ghi vào
+repo này, để mọi repo trong stack đều thấy.
