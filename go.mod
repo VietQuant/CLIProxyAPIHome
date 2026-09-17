@@ -110,4 +110,4 @@ require (
 
 // Build against the sibling fork checkout so SDK edits made in
 // VietQuant/CLIProxyAPI are picked up here without publishing a tag.
-replace github.com/router-for-me/CLIProxyAPI/v7 => ../CLIProxyAPI
+replace github.com/router-for-me/CLIProxyAPI/v7 => ../proxy
