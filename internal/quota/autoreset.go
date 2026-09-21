@@ -356,11 +356,28 @@ func (a *AutoReset) consumeCredit(ctx context.Context, auth *coreauth.Auth) erro
 	if errMarshal != nil {
 		return fmt.Errorf("encode redeem request: %w", errMarshal)
 	}
-	_, _, errProbe := a.collector.probeRequest(ctx, auth, http.MethodPost, codexResetCreditsConsumeURL, body, headers)
+	payload, _, errProbe := a.collector.probeRequest(ctx, auth, http.MethodPost, codexResetCreditsConsumeURL, body, headers)
 	if errProbe != nil {
 		return fmt.Errorf("consume reset credit: %s", errProbe.message)
 	}
+	// A 2xx does not prove the credit was redeemed: the provider answers 200 for
+	// requests it declines too. Nothing here parses the body because its shape on the
+	// decline path is unverified; recording it is what makes that shape knowable.
+	log.WithField("response", truncateForLog(payload, maxConsumeLogBytes)).
+		Debug("quota auto reset: consume response")
 	return nil
+}
+
+// maxConsumeLogBytes caps how much of a consume response reaches the log. The body is
+// small in practice; the cap only guards against an unexpected payload.
+const maxConsumeLogBytes = 512
+
+func truncateForLog(payload []byte, limit int) string {
+	text := strings.TrimSpace(string(payload))
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "...(truncated)"
 }
 
 // newRedeemRequestID produces the UUIDv4 the provider expects as an idempotency key.

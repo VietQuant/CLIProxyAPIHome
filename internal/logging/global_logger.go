@@ -36,9 +36,13 @@ func FormatLogSourcePrefix(source string) string {
 	return fmt.Sprintf("[%-*s]", logSourceLabelWidth, source)
 }
 
-// logFieldOrder defines the display order for common log fields.
+// logFieldOrder defines the display order for common log fields. Fields absent from
+// this list are dropped, so anything worth reading in production belongs here: quota
+// auto reset once emitted 2191 identical lines whose credential_id and reason were
+// silently discarded, leaving no way to tell which credential was looping.
 var logFieldOrder = []string{
 	"provider", "model",
+	"credential_id", "label", "reason", "available_count", "response",
 	"plugin_id", "plugin_name", "source_id",
 	"version", "active_version", "retired_version", "overwritten",
 	"mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error",
