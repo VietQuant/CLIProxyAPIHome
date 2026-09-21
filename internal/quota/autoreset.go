@@ -246,6 +246,12 @@ func (a *AutoReset) decide(item *cluster.QuotaCredentialSnapshot, options AutoRe
 			if credit.ExpiresAt == nil {
 				continue
 			}
+			// A credit that already expired cannot be redeemed, and it satisfies the
+			// rescue window below on every tick, so the rule would spend on it forever.
+			// Skip to the next credit, which the sort order says expires later.
+			if !credit.ExpiresAt.After(now) {
+				continue
+			}
 			if !credit.ExpiresAt.After(now.Add(options.ExpiryWindow)) {
 				return fmt.Sprintf("credit_expiring_at_%s", credit.ExpiresAt.UTC().Format(time.RFC3339)), true
 			}

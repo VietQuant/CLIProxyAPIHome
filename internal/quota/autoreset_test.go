@@ -112,6 +112,66 @@ func TestDecideRuleBSkipsDistantExpiry(t *testing.T) {
 	}
 }
 
+// An expired credit cannot be redeemed, yet it satisfies the rescue window on every
+// tick. Left unguarded the rule spends on it forever: one stale snapshot holding an
+// expired credit produced 2191 consume attempts in 30 hours.
+func TestDecideRuleBIgnoresExpiredCredit(t *testing.T) {
+	now := time.Now().UTC()
+	a := testAutoReset(AutoResetOptions{RuleBEnabled: true, ExpiryWindow: 6 * time.Hour})
+	item := &cluster.QuotaCredentialSnapshot{
+		ResetCredits: creditsWithExpiry(timePtr(now.Add(-2 * time.Hour))),
+		Windows:      []cluster.QuotaWindow{{RemainingRatio: floatPtr(1)}},
+	}
+	if reason, ok := a.decide(item, a.currentOptions(), now); ok {
+		t.Fatalf("decide() = %q; want no spend on an expired credit", reason)
+	}
+}
+
+// Expiry sorts nulls last, so an expired credit sits ahead of live ones. Skipping it
+// must not skip the rest: the credit behind it may genuinely need rescuing.
+func TestDecideRuleBRescuesLiveCreditBehindExpiredOne(t *testing.T) {
+	now := time.Now().UTC()
+	a := testAutoReset(AutoResetOptions{RuleBEnabled: true, ExpiryWindow: 6 * time.Hour})
+	count := 2
+	item := &cluster.QuotaCredentialSnapshot{
+		ResetCredits: &cluster.QuotaResetCredits{
+			AvailableCount: &count,
+			Credits: []cluster.QuotaResetCredit{
+				{ID: "expired", Status: "available", ExpiresAt: timePtr(now.Add(-2 * time.Hour))},
+				{ID: "live", Status: "available", ExpiresAt: timePtr(now.Add(time.Hour))},
+			},
+		},
+		Windows: []cluster.QuotaWindow{{RemainingRatio: floatPtr(1)}},
+	}
+	reason, ok := a.decide(item, a.currentOptions(), now)
+	if !ok {
+		t.Fatal("decide() did not rescue the live credit behind an expired one")
+	}
+	if reason == "quota_exhausted" {
+		t.Fatalf("decide() = %q; want an expiry reason", reason)
+	}
+}
+
+// A distant credit behind an expired one still must not be spent early.
+func TestDecideRuleBStopsAtFirstLiveDistantCredit(t *testing.T) {
+	now := time.Now().UTC()
+	a := testAutoReset(AutoResetOptions{RuleBEnabled: true, ExpiryWindow: 6 * time.Hour})
+	count := 2
+	item := &cluster.QuotaCredentialSnapshot{
+		ResetCredits: &cluster.QuotaResetCredits{
+			AvailableCount: &count,
+			Credits: []cluster.QuotaResetCredit{
+				{ID: "expired", Status: "available", ExpiresAt: timePtr(now.Add(-2 * time.Hour))},
+				{ID: "distant", Status: "available", ExpiresAt: timePtr(now.Add(72 * time.Hour))},
+			},
+		},
+		Windows: []cluster.QuotaWindow{{RemainingRatio: floatPtr(1)}},
+	}
+	if reason, ok := a.decide(item, a.currentOptions(), now); ok {
+		t.Fatalf("decide() = %q; want no spend when the live credit expires days out", reason)
+	}
+}
+
 // Both rules disabled must never spend, even when every other condition holds.
 func TestDecideRespectsDisabledRules(t *testing.T) {
 	now := time.Now().UTC()
