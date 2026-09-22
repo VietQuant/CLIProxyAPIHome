@@ -51,24 +51,25 @@ var defaultAntigravityURLs = []string{
 }
 
 type Options struct {
-	Owner                  string
-	HomeID                 string
-	GlobalProxyURL         string
-	GlobalProxyURLProvider func() string
-	PollInterval           time.Duration
-	ProbeTimeout           time.Duration
-	LeaseDuration          time.Duration
-	SnapshotFreshness      time.Duration
-	ProviderConcurrency    int
-	CodexUsageURL          string
-	CodexResetCreditsURL   string
-	ClaudeUsageURL         string
-	ClaudeProfileURL       string
-	KimiUsageURL           string
-	XAIBillingURL          string
-	AntigravityURLs        []string
-	Now                    func() time.Time
-	HTTPClient             func(*coreauth.Auth, time.Duration) (*http.Client, error)
+	Owner                       string
+	HomeID                      string
+	GlobalProxyURL              string
+	GlobalProxyURLProvider      func() string
+	PollInterval                time.Duration
+	ProbeTimeout                time.Duration
+	LeaseDuration               time.Duration
+	SnapshotFreshness           time.Duration
+	ProviderConcurrency         int
+	CodexUsageURL               string
+	CodexResetCreditsURL        string
+	CodexResetCreditsConsumeURL string
+	ClaudeUsageURL              string
+	ClaudeProfileURL            string
+	KimiUsageURL                string
+	XAIBillingURL               string
+	AntigravityURLs             []string
+	Now                         func() time.Time
+	HTTPClient                  func(*coreauth.Auth, time.Duration) (*http.Client, error)
 }
 
 type Collector struct {
@@ -112,6 +113,9 @@ func NewCollector(repo *cluster.Repository, options Options) *Collector {
 	}
 	if strings.TrimSpace(options.CodexResetCreditsURL) == "" {
 		options.CodexResetCreditsURL = codexResetCreditsURL
+	}
+	if strings.TrimSpace(options.CodexResetCreditsConsumeURL) == "" {
+		options.CodexResetCreditsConsumeURL = codexResetCreditsConsumeURL
 	}
 	if strings.TrimSpace(options.ClaudeUsageURL) == "" {
 		options.ClaudeUsageURL = claudeUsageURL
@@ -310,6 +314,12 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 		return
 	}
 	if !claimed {
+		// Losing this claim is routine under concurrency (another node or an
+		// in-progress probe already holds the lease/eligibility window) and used to
+		// be silent here, which twice cost a full investigation to notice a
+		// credential stuck without a completing probe. Info, not Debug: the fields
+		// are cheap and the alternative is invisible-by-default.
+		log.WithFields(log.Fields{"credential_id": auth.ID, "force": force}).Info("quota collector: probe claim not acquired, skipping")
 		return
 	}
 	resolveCtx, cancelResolve := context.WithTimeout(ctx, c.options.ProbeTimeout)

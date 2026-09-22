@@ -306,19 +306,23 @@ func (a *AutoReset) spend(ctx context.Context, item *cluster.QuotaCredentialSnap
 		"label":         item.Label,
 		"reason":        reason,
 	}
+	var beforeAvailableCount *int
 	if item.ResetCredits != nil && item.ResetCredits.AvailableCount != nil {
-		fields["available_count"] = *item.ResetCredits.AvailableCount
+		beforeAvailableCount = item.ResetCredits.AvailableCount
+		fields["available_count"] = *beforeAvailableCount
 	}
 
-	// Claiming the probe lease is what makes this safe to run on every node: only the
-	// node that wins the claim proceeds, and the lease expires on its own if this
-	// node dies mid-spend.
-	claimed, errClaim := a.repo.ClaimQuotaProbe(ctx, item.CredentialID, a.collector.options.Owner, now, autoResetSpendLease)
+	// The spend lease is its own claim, separate from the probe lease: it only
+	// serializes this credit-consume call across Home nodes and never touches
+	// collection_status, so the re-probe below is free to claim the probe lease
+	// on its own terms instead of losing a race against a lease spend() just set.
+	claimed, errClaim := a.repo.ClaimQuotaSpendLease(ctx, item.CredentialID, a.collector.options.Owner, now, autoResetSpendLease)
 	if errClaim != nil {
-		log.WithError(errClaim).WithFields(fields).Warn("quota auto reset: lease claim failed")
+		log.WithError(errClaim).WithFields(fields).Warn("quota auto reset: spend lease claim failed")
 		return
 	}
 	if !claimed {
+		log.WithFields(fields).Info("quota auto reset: spend lease held by another attempt")
 		return
 	}
 
@@ -331,12 +335,44 @@ func (a *AutoReset) spend(ctx context.Context, item *cluster.QuotaCredentialSnap
 		log.WithError(errConsume).WithFields(fields).Warn("quota auto reset: credit consume failed")
 		return
 	}
-	log.WithFields(fields).Info("quota auto reset: reset credit consumed")
+	log.WithFields(fields).Info("quota auto reset: reset credit consume request sent")
 
-	// Re-probe so the snapshot reflects the restored window immediately; without this
-	// the next tick would read the pre-reset numbers and could spend a second credit.
-	if _, errTrigger := a.collector.TriggerCollection(ctx, map[string]struct{}{item.CredentialID: {}}, nil); errTrigger != nil {
-		log.WithError(errTrigger).WithFields(fields).Warn("quota auto reset: post-reset collection failed")
+	// Re-probe synchronously, now that the spend lease no longer blocks the probe
+	// lease, so the comparison below reflects this attempt rather than a stale
+	// snapshot from before the consume call.
+	a.collector.collectCredential(ctx, auth, true)
+
+	redeemedFields := log.Fields{
+		"credential_id": item.CredentialID,
+		"label":         item.Label,
+		"reason":        reason,
+	}
+	refreshed, errRefresh := a.repo.GetQuotaCredential(ctx, item.CredentialID, a.collector.options.Now().UTC())
+	if errRefresh != nil {
+		log.WithError(errRefresh).WithFields(redeemedFields).Warn("quota auto reset: post-consume verification failed")
+		return
+	}
+	var afterAvailableCount *int
+	if refreshed.ResetCredits != nil && refreshed.ResetCredits.AvailableCount != nil {
+		afterAvailableCount = refreshed.ResetCredits.AvailableCount
+	}
+	if afterAvailableCount != nil {
+		redeemedFields["available_count"] = *afterAvailableCount
+	}
+	switch {
+	case beforeAvailableCount == nil || afterAvailableCount == nil:
+		// The provider does not always return a count on every probe; a missing
+		// value on either side means the comparison cannot be made, not that the
+		// spend failed. Say so rather than guessing either outcome.
+		log.WithFields(redeemedFields).Warn("quota auto reset: reset credit consume result could not be verified")
+	case *afterAvailableCount < *beforeAvailableCount:
+		log.WithFields(redeemedFields).Info("quota auto reset: reset credit consumed")
+	default:
+		// A non-error HTTP response does not prove redemption (the provider can
+		// answer 2xx for a request it declines), and this is the case that cost
+		// two prior investigations: dozens of "consumed" log lines with the count
+		// never moving. Report the unmoved count plainly instead of repeating that.
+		log.WithFields(redeemedFields).Warn("quota auto reset: reset credit consume request accepted but available_count did not decrease")
 	}
 }
 
@@ -356,7 +392,7 @@ func (a *AutoReset) consumeCredit(ctx context.Context, auth *coreauth.Auth) erro
 	if errMarshal != nil {
 		return fmt.Errorf("encode redeem request: %w", errMarshal)
 	}
-	payload, _, errProbe := a.collector.probeRequest(ctx, auth, http.MethodPost, codexResetCreditsConsumeURL, body, headers)
+	payload, _, errProbe := a.collector.probeRequest(ctx, auth, http.MethodPost, a.collector.options.CodexResetCreditsConsumeURL, body, headers)
 	if errProbe != nil {
 		return fmt.Errorf("consume reset credit: %s", errProbe.message)
 	}

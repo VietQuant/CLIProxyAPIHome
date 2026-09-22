@@ -1,7 +1,12 @@
 package quota
 
 import (
+	"context"
+	"encoding/json"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -241,5 +246,144 @@ func TestNewRedeemRequestIDIsUUIDv4(t *testing.T) {
 			t.Fatalf("newRedeemRequestID() returned duplicate %q", id)
 		}
 		seen[id] = struct{}{}
+	}
+}
+
+// codexResetCreditSpendStub serves the three Codex endpoints AutoReset.spend()'s
+// path touches: usage (exhausted window), reset-credits balance, and consume. The
+// balance served after consume is called drops by one, the way a real redemption
+// would look; a stub that never moves the count would make the regression this
+// test guards against invisible.
+func codexResetCreditSpendStub(t *testing.T, consumed *int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "reset-credits/consume"):
+			*consumed++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case strings.Contains(r.URL.Path, "reset-credits"):
+			available := 2
+			if *consumed > 0 {
+				available = 1
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"available_count": available, "credits": []any{}})
+		default:
+			_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_after_seconds":345600,"reset_at":1758542400}}}`))
+		}
+	}))
+}
+
+// TestSpendReleasesProbeLeaseForImmediateReprobe is the regression test for the
+// collecting-status livelock: AutoReset.spend() used to claim the probe lease
+// (ClaimQuotaProbe) purely to serialize its own HTTP call, which stamped
+// collection_status="collecting" as a side effect. Its own follow-up re-probe then
+// always lost the claim race against the lease it had just set two lines earlier,
+// so collectCredential's silent !claimed no-op left the row stuck at "collecting"
+// forever with the credit never confirmed spent or not.
+//
+// This test fails on the pre-fix code (spend() calling ClaimQuotaProbe) because
+// the forced re-probe claim loses that race and the snapshot is never rewritten:
+// collection_status stays "collecting" and the reset-credit balance is never
+// re-read, so available_count still reads 2. It passes once spend() claims its
+// own lease (ClaimQuotaSpendLease) instead, leaving the probe lease free for the
+// re-probe to claim, complete, and observe the balance drop to 1.
+func TestSpendReleasesProbeLeaseForImmediateReprobe(t *testing.T) {
+	ctx := context.Background()
+	repo := newCollectorTestRepository(t)
+	const credentialID = "codex-spend-livelock"
+	seedCollectorProviderAuth(t, repo, credentialID, "codex", map[string]any{"type": "codex", "access_token": "probe-secret"})
+
+	now := time.Date(2026, 9, 22, 9, 0, 0, 0, time.UTC)
+	credits := 2
+	expiresAt := now.Add(-time.Minute) // already stale so exhaustion is visible immediately
+	if _, errSeed := repo.UpsertQuotaSnapshot(ctx, cluster.QuotaSnapshotWrite{
+		CredentialID: credentialID, QuotaStatus: "exhausted", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &now, ExpiresAt: &expiresAt, LastSuccessAt: &now,
+		ReplaceWindows: true, Windows: []cluster.QuotaWindow{{
+			ID: "codex-1-week", Scope: "account", Mode: "rolling", Status: "exhausted", Unit: "percentage",
+			RemainingRatio: floatPtr(0), ResetAt: timePtr(now.Add(96 * time.Hour)), PeriodUnit: "week", PeriodValue: floatPtr(1), Source: "active_probe", ObservedAt: now,
+		}},
+		ResetCredits:        &cluster.QuotaResetCredits{AvailableCount: &credits, ObservedAt: now, Credits: []cluster.QuotaResetCredit{{ID: "credit-1", Status: "available", GrantedAt: now.Add(-24 * time.Hour), ExpiresAt: nil}}},
+		ReplaceResetCredits: true,
+	}); errSeed != nil {
+		t.Fatalf("UpsertQuotaSnapshot() error = %v", errSeed)
+	}
+
+	var consumed int32
+	server := codexResetCreditSpendStub(t, &consumed)
+	defer server.Close()
+
+	collector := NewCollector(repo, Options{
+		Owner: "home-a", CodexUsageURL: server.URL + "/usage", CodexResetCreditsURL: server.URL + "/reset-credits",
+		CodexResetCreditsConsumeURL: server.URL + "/reset-credits/consume", Now: func() time.Time { return now },
+	})
+	autoReset := NewAutoReset(repo, collector, AutoResetOptions{Enabled: true, RuleAEnabled: true, ThresholdPercent: 0, WithinDays: 1, Now: func() time.Time { return now }})
+	if autoReset == nil {
+		t.Fatal("NewAutoReset() returned nil")
+	}
+
+	item, errGet := repo.GetQuotaCredential(ctx, credentialID, now)
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	reason, ok := autoReset.decide(item, autoReset.currentOptions(), now)
+	if !ok || reason != "quota_exhausted" {
+		t.Fatalf("decide() = %q, %v; want quota_exhausted, true", reason, ok)
+	}
+
+	autoReset.spend(ctx, item, reason, now)
+
+	if consumed != 1 {
+		t.Fatalf("consume requests = %d, want exactly 1", consumed)
+	}
+
+	refreshed, errRefresh := repo.GetQuotaCredential(ctx, credentialID, now)
+	if errRefresh != nil {
+		t.Fatalf("GetQuotaCredential() after spend error = %v", errRefresh)
+	}
+	if refreshed.CollectionStatus != "success" {
+		t.Fatalf("collection_status after spend = %q, want %q (the probe lease must not be blocked by spend's own lease)", refreshed.CollectionStatus, "success")
+	}
+	if refreshed.ResetCredits == nil || refreshed.ResetCredits.AvailableCount == nil {
+		t.Fatal("reset_credits.available_count missing after spend; the re-probe must have run to confirm the redemption")
+	}
+	if *refreshed.ResetCredits.AvailableCount != 1 {
+		t.Fatalf("available_count after spend = %d, want 1 (the re-probe must observe the post-consume balance)", *refreshed.ResetCredits.AvailableCount)
+	}
+}
+
+// TestClaimQuotaSpendLeaseDoesNotBlockProbeLease is a narrower, single-purpose
+// proof of the same fix at the repository layer: claiming the spend lease must
+// never touch collection_status or the probe lease, so a probe claim on the same
+// credential succeeds immediately afterward.
+func TestClaimQuotaSpendLeaseDoesNotBlockProbeLease(t *testing.T) {
+	ctx := context.Background()
+	repo := newCollectorTestRepository(t)
+	const credentialID = "codex-spend-lease-isolated"
+	seedCollectorProviderAuth(t, repo, credentialID, "codex", map[string]any{"type": "codex", "access_token": "probe-secret"})
+	now := time.Date(2026, 9, 22, 9, 0, 0, 0, time.UTC)
+
+	claimed, errClaim := repo.ClaimQuotaSpendLease(ctx, credentialID, "home-a", now, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("ClaimQuotaSpendLease() = %v, %v; want true, nil", claimed, errClaim)
+	}
+
+	item, errGet := repo.GetQuotaCredential(ctx, credentialID, now)
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	if item.CollectionStatus == "collecting" {
+		t.Fatalf("collection_status = %q after claiming the spend lease; the spend lease must not touch collection_status", item.CollectionStatus)
+	}
+
+	// spend()'s own re-probe goes through the forced path (collectCredential with
+	// force=true), so this mirrors that rather than the scheduled non-forced claim.
+	probeClaimed, errProbeClaim := repo.ForceClaimEligibleQuotaProbe(ctx, credentialID, "home-a", now, time.Minute)
+	if errProbeClaim != nil {
+		t.Fatalf("ForceClaimEligibleQuotaProbe() error = %v", errProbeClaim)
+	}
+	if !probeClaimed {
+		t.Fatal("ForceClaimEligibleQuotaProbe() = false; the spend lease must not block the probe lease")
 	}
 }

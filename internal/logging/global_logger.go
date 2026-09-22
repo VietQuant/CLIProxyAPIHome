@@ -42,7 +42,7 @@ func FormatLogSourcePrefix(source string) string {
 // silently discarded, leaving no way to tell which credential was looping.
 var logFieldOrder = []string{
 	"provider", "model",
-	"credential_id", "label", "reason", "available_count", "response",
+	"credential_id", "label", "reason", "available_count", "force", "response",
 	"plugin_id", "plugin_name", "source_id",
 	"version", "active_version", "retired_version", "overwritten",
 	"mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error",
