@@ -10,7 +10,7 @@ import (
 // currentDatabaseVersion is shared by the live schema migration gate and the
 // portable snapshot format. Increment it for every required startup migration
 // or snapshot format change, and retain mappings for prior snapshot formats.
-const currentDatabaseVersion = 7
+const currentDatabaseVersion = 8
 
 // databaseModel describes one managed Home database table.
 type databaseModel struct {
@@ -275,6 +275,9 @@ var databaseSnapshotV5Models = databaseSnapshotV5ModelRegistry()
 
 var databaseSnapshotV6Models = databaseSnapshotV6ModelRegistry()
 
+// databaseSnapshotV7Models is the frozen database snapshot format v7 registry.
+var databaseSnapshotV7Models = databaseSnapshotV7ModelRegistry()
+
 // homeDatabaseModels is the current database snapshot registry.
 var homeDatabaseModels = currentDatabaseModels()
 
@@ -348,10 +351,17 @@ func databaseSnapshotV6ModelRegistry() []databaseModel {
 	return models
 }
 
-func currentDatabaseModels() []databaseModel {
+func databaseSnapshotV7ModelRegistry() []databaseModel {
 	models := append([]databaseModel(nil), databaseSnapshotV6Models...)
 	return append(models,
 		newDatabaseModel[QuotaAutoResetConfigRecord]("quota_auto_reset_config", []string{"id"}, false, true),
+	)
+}
+
+func currentDatabaseModels() []databaseModel {
+	models := append([]databaseModel(nil), databaseSnapshotV7Models...)
+	return append(models,
+		newDatabaseModel[QuotaSpendLeaseRecord]("quota_spend_lease", []string{"credential_id"}, false, true),
 	)
 }
 
@@ -369,6 +379,8 @@ func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
 		return databaseSnapshotV5Models, true
 	case 6:
 		return databaseSnapshotV6Models, true
+	case 7:
+		return databaseSnapshotV7Models, true
 	case currentDatabaseVersion:
 		return homeDatabaseModels, true
 	default:

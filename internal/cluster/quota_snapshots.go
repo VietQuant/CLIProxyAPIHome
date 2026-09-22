@@ -88,14 +88,6 @@ type QuotaSnapshotRecord struct {
 	ResetCredits        JSONB      `gorm:"column:reset_credits"`
 	ProbeLeaseOwner     string     `gorm:"column:probe_lease_owner;size:256"`
 	ProbeLeaseExpiresAt *time.Time `gorm:"column:probe_lease_expires_at;index"`
-	// SpendLeaseOwner/SpendLeaseExpiresAt serialize AutoReset.spend()'s credit-consume
-	// call across Home nodes independently of the probe lease above. They must never
-	// be touched by the collector's claim/completion paths: reusing the probe lease
-	// for this purpose previously stamped collection_status="collecting" as a side
-	// effect and made spend()'s own post-reset re-probe lose the claim race against
-	// its own just-set lease, leaving the row stuck in "collecting" forever.
-	SpendLeaseOwner     string     `gorm:"column:spend_lease_owner;size:256"`
-	SpendLeaseExpiresAt *time.Time `gorm:"column:spend_lease_expires_at;index"`
 	ParserVersion       int        `gorm:"column:parser_version;not null;default:1"`
 	CollectorVersion    int        `gorm:"column:collector_version;not null;default:1"`
 	CreatedAt           time.Time  `gorm:"column:created_at"`
@@ -601,68 +593,6 @@ func quotaWindowRecordAggregateSource(windows []QuotaWindowRecord) string {
 		}
 	}
 	return source
-}
-
-// ClaimQuotaSpendLease serializes AutoReset's credit-consume call across Home
-// nodes. It is intentionally independent of the probe lease claimed by
-// ClaimQuotaProbe/ClaimEligibleQuotaProbe/ForceClaimEligibleQuotaProbe: those
-// functions stamp collection_status="collecting" as part of claiming, and a
-// spend lease that reused them would leave that status stuck whenever the
-// caller's own follow-up probe claim raced against the lease it just set.
-// The row is created on first use so a credential need not have been probed
-// yet to be spent on.
-func (r *Repository) ClaimQuotaSpendLease(ctx context.Context, credentialID string, owner string, now time.Time, leaseDuration time.Duration) (bool, error) {
-	credentialID = strings.TrimSpace(credentialID)
-	owner = strings.TrimSpace(owner)
-	if credentialID == "" || owner == "" {
-		return false, fmt.Errorf("quota spend lease credential and owner are required")
-	}
-	if now.IsZero() {
-		now = time.Now().UTC()
-	} else {
-		now = now.UTC()
-	}
-	if leaseDuration <= 0 {
-		leaseDuration = time.Minute
-	}
-	db, errDB := r.database()
-	if errDB != nil {
-		return false, errDB
-	}
-	claimed := false
-	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
-		var record QuotaSnapshotRecord
-		errFind := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&record, "credential_id = ?", credentialID).Error
-		if errFind != nil && !errors.Is(errFind, gorm.ErrRecordNotFound) {
-			return errFind
-		}
-		leaseExpiresAt := now.Add(leaseDuration)
-		if errors.Is(errFind, gorm.ErrRecordNotFound) {
-			record = QuotaSnapshotRecord{
-				CredentialID: credentialID, QuotaStatus: "unknown", CollectionStatus: "idle",
-				SpendLeaseOwner: owner, SpendLeaseExpiresAt: &leaseExpiresAt,
-				ParserVersion: quotaSnapshotSchemaVersion, CollectorVersion: quotaSnapshotSchemaVersion,
-				CreatedAt: now, UpdatedAt: now,
-			}
-			if errCreate := tx.Create(&record).Error; errCreate != nil {
-				return errCreate
-			}
-			claimed = true
-			return nil
-		}
-		if record.SpendLeaseExpiresAt != nil && record.SpendLeaseExpiresAt.After(now) {
-			return nil
-		}
-		updates := map[string]any{
-			"spend_lease_owner": owner, "spend_lease_expires_at": leaseExpiresAt, "updated_at": now,
-		}
-		if errUpdate := tx.Model(&QuotaSnapshotRecord{}).Where("credential_id = ?", credentialID).Updates(updates).Error; errUpdate != nil {
-			return errUpdate
-		}
-		claimed = true
-		return nil
-	})
-	return claimed, errTransaction
 }
 
 func (r *Repository) ClaimQuotaProbe(ctx context.Context, credentialID string, owner string, now time.Time, leaseDuration time.Duration) (bool, error) {
