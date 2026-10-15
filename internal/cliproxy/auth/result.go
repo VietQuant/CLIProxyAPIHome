@@ -807,8 +807,14 @@ func hasModelError(auth *Auth, now time.Time) bool {
 		if state == nil {
 			continue
 		}
-		if state.LastError != nil {
-			return true
+		// A recorded error only reflects a problem while the model is still
+		// blocked. Transient failures (5xx, 429) clear Unavailable once their
+		// retry window elapses, but leave LastError behind; without this bound
+		// the credential stays flagged forever.
+		if state.LastError != nil && state.Unavailable {
+			if state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now) {
+				return true
+			}
 		}
 		if state.Status == StatusError {
 			if state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)) {

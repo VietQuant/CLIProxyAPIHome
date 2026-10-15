@@ -391,3 +391,98 @@ func TestAuthRefreshBackoffDoesNotBlockModels(t *testing.T) {
 		t.Fatalf("isAuthBlockedForModel() = %v, %v, %v; want dispatchable", blocked, reason, next)
 	}
 }
+
+func TestHasModelErrorIgnoresExpiredModelError(t *testing.T) {
+	now := time.Date(2026, 10, 15, 14, 0, 0, 0, time.UTC)
+	stale := now.Add(-72 * time.Hour)
+
+	tests := []struct {
+		name  string
+		state *ModelState
+		want  bool
+	}{
+		{
+			// Transient 5xx whose one-minute retry window elapsed: the model
+			// recovered and is dispatchable, so the credential is not flagged.
+			name: "expired transient error",
+			state: &ModelState{
+				Status:         StatusError,
+				Unavailable:    false,
+				NextRetryAfter: time.Time{},
+				UpdatedAt:      stale,
+				LastError:      &Error{Message: "server is overloaded", HTTPStatus: http.StatusBadGateway},
+			},
+			want: false,
+		},
+		{
+			name: "active transient error inside retry window",
+			state: &ModelState{
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Minute),
+				UpdatedAt:      now,
+				LastError:      &Error{Message: "server is overloaded", HTTPStatus: http.StatusBadGateway},
+			},
+			want: true,
+		},
+		{
+			// Hard failures stay blocked without scheduling a retry, so a zero
+			// NextRetryAfter must keep flagging the credential.
+			name: "unauthorized without scheduled retry",
+			state: &ModelState{
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: time.Time{},
+				UpdatedAt:      stale,
+				LastError:      &Error{Message: "unauthorized", HTTPStatus: http.StatusUnauthorized},
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &Auth{ID: "auth-model-error", ModelStates: map[string]*ModelState{"gpt-5.5": tc.state}}
+			if got := hasModelError(auth, now); got != tc.want {
+				t.Fatalf("hasModelError() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasModelErrorExpiredErrorDoesNotBlockSuccessClearing(t *testing.T) {
+	now := time.Date(2026, 10, 15, 14, 0, 0, 0, time.UTC)
+	stale := now.Add(-72 * time.Hour)
+
+	// Mirrors the observed live shape: a credential pinned to StatusError by an
+	// expired error on one model while another model keeps serving traffic.
+	auth := &Auth{
+		ID:            "auth-cross-model",
+		Status:        StatusError,
+		StatusMessage: "server is overloaded",
+		LastError:     &Error{Message: "server is overloaded", HTTPStatus: http.StatusBadGateway},
+		ModelStates: map[string]*ModelState{
+			"gpt-5.5": {
+				Status:         StatusError,
+				Unavailable:    false,
+				NextRetryAfter: time.Time{},
+				UpdatedAt:      stale,
+				LastError:      &Error{Message: "server is overloaded", HTTPStatus: http.StatusBadGateway},
+			},
+			"gpt-6-sol": {Status: StatusActive, UpdatedAt: stale},
+		},
+	}
+
+	manager := NewManager(nil, nil, nil)
+	manager.applyResultTransition(auth, Result{AuthID: auth.ID, Provider: "codex", Model: "gpt-6-sol", Success: true}, "gpt-6-sol", now, false)
+
+	if auth.Status != StatusActive {
+		t.Fatalf("auth.Status = %q, want %q", auth.Status, StatusActive)
+	}
+	if auth.LastError != nil {
+		t.Fatalf("auth.LastError = %+v, want nil", auth.LastError)
+	}
+	if auth.StatusMessage != "" {
+		t.Fatalf("auth.StatusMessage = %q, want empty", auth.StatusMessage)
+	}
+}
