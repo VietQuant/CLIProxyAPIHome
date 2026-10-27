@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 )
 
@@ -159,6 +160,7 @@ type UsageObservabilityTotals struct {
 	TotalTokens           int64
 	TokenBreakdown        UsageTokenBreakdown
 	TotalAmount           *float64
+	UnpricedRequests      int64
 	Currency              string
 	BlendedCostPer1M      *float64
 	AvgLatencyMS          *float64
@@ -238,6 +240,7 @@ type UsageObservabilityAggregateItem struct {
 	TotalTokens         int64
 	TokenBreakdown      UsageTokenBreakdown
 	TotalAmount         *float64
+	UnpricedRequests    int64
 	Currency            string
 	AvgLatencyMS        *float64
 	P95LatencyMS        *float64
@@ -467,6 +470,7 @@ type usageObservabilityAggregateRow struct {
 	AccountingReasoningTokens  int64           `gorm:"column:accounting_reasoning_tokens"`
 	UnclassifiedTokens         int64           `gorm:"column:unclassified_tokens"`
 	TotalAmount                sql.NullFloat64 `gorm:"column:total_amount"`
+	UnpricedRequests           int64           `gorm:"column:unpriced_requests"`
 	AvgLatencyMS               sql.NullFloat64 `gorm:"column:avg_latency_ms"`
 	P95LatencyMS               sql.NullFloat64 `gorm:"column:p95_latency_ms"`
 	LastUsedAt                 string          `gorm:"column:last_used_at"`
@@ -547,6 +551,7 @@ type usageObservabilityTotalsRow struct {
 	AccountingReasoningTokens  sql.NullInt64   `gorm:"column:accounting_reasoning_tokens"`
 	UnclassifiedTokens         sql.NullInt64   `gorm:"column:unclassified_tokens"`
 	TotalAmount                sql.NullFloat64 `gorm:"column:total_amount"`
+	UnpricedRequests           sql.NullInt64   `gorm:"column:unpriced_requests"`
 	AvgLatencyMS               sql.NullFloat64 `gorm:"column:avg_latency_ms"`
 	AvgTTFTMS                  sql.NullFloat64 `gorm:"column:avg_ttft_ms"`
 	ActiveUserCount            int64           `gorm:"column:active_user_count"`
@@ -799,23 +804,96 @@ func (r *Repository) ListUsageObservabilityAggregates(ctx context.Context, query
 	return UsageObservabilityAggregateResult{Items: items, Total: total}, nil
 }
 
+// usageObservabilityOverviewConcurrency caps how many overview sections query
+// the database at the same time for one request.
+const usageObservabilityOverviewConcurrency = 6
+
 func (r *Repository) UsageObservabilityOverview(ctx context.Context, query UsageObservabilityOverviewQuery) (UsageObservabilityOverview, error) {
 	db, errDB := r.database()
 	if errDB != nil {
 		return UsageObservabilityOverview{}, errDB
 	}
-	db = db.WithContext(contextOrBackground(ctx))
 	recordQuery := usageObservabilityOverviewRecordQuery(query)
-	totals, bounds, errTotals := usageObservabilityTotalsSQL(db, recordQuery)
-	if errTotals != nil {
-		return UsageObservabilityOverview{}, errTotals
-	}
-
 	location := usageObservabilityLocation(query.Timezone)
-	interval, errInterval := usageObservabilityOverviewIntervalForBounds(query.Interval, location, query.From, query.To, bounds)
-	if errInterval != nil {
-		return UsageObservabilityOverview{}, errInterval
+
+	// Every section below scans the whole requested window, so running them one
+	// after another makes the response time grow with the number of sections.
+	// Only the trend depends on the totals (it needs the observed bounds), so the
+	// rest run concurrently. The limit bounds the extra load on the shared
+	// database for a single overview request.
+	group, groupCtx := errgroup.WithContext(contextOrBackground(ctx))
+	group.SetLimit(usageObservabilityOverviewConcurrency)
+	db = db.WithContext(groupCtx)
+
+	var (
+		totals          UsageObservabilityTotals
+		interval        string
+		trend           []UsageObservabilityTrendPoint
+		live            UsageObservabilityLiveSummary
+		modelEfficiency []UsageObservabilityAggregateItem
+		top             UsageObservabilityTopGroups
+		bounds          usageObservabilityOverviewBounds
+	)
+	runTrend := func(trendBounds usageObservabilityOverviewBounds) error {
+		var errInterval error
+		interval, errInterval = usageObservabilityOverviewIntervalForBounds(query.Interval, location, query.From, query.To, trendBounds)
+		if errInterval != nil {
+			return errInterval
+		}
+		trendRows, errTrend := usageObservabilityTrendSQL(db, recordQuery, interval, location, trendBounds)
+		if errTrend != nil {
+			return errTrend
+		}
+		trend, errTrend = usageObservabilityFillTrend(trendRows, interval, location, query.From, query.To, trendBounds)
+		return errTrend
 	}
+	// With an explicit [from, to) range the trend never reads the observed bounds
+	// (interval, buckets and fill all take from/to instead), so it does not have
+	// to wait for the totals. An open-ended range still derives them from totals.
+	explicitRange := query.From != nil && query.To != nil
+	var (
+		percentiles  usageObservabilityLatencyPercentileRow
+		activeCounts usageObservabilityActiveCountsRow
+	)
+	group.Go(func() error {
+		var errTotals error
+		totals, bounds, errTotals = usageObservabilityTotalsBaseSQL(db, recordQuery)
+		if errTotals != nil || explicitRange {
+			return errTotals
+		}
+		return runTrend(bounds)
+	})
+	group.Go(func() error {
+		var errPercentiles error
+		percentiles, errPercentiles = usageObservabilityLatencyPercentilesSQL(db, recordQuery)
+		return errPercentiles
+	})
+	group.Go(func() error {
+		var errActive error
+		activeCounts, errActive = usageObservabilityActiveCountsSQL(db, recordQuery)
+		return errActive
+	})
+	if explicitRange {
+		group.Go(func() error {
+			return runTrend(usageObservabilityOverviewBounds{})
+		})
+	}
+	group.Go(func() error {
+		var errLive error
+		live, errLive = usageObservabilityLiveSQL(db, recordQuery, 300)
+		return errLive
+	})
+	group.Go(func() error {
+		var errModelEfficiency error
+		modelEfficiency, errModelEfficiency = usageObservabilityAggregateItemsSQL(db, recordQuery, "model", "total_tokens", "desc", 10)
+		return errModelEfficiency
+	})
+	usageObservabilityTopSQLConcurrent(group, db, recordQuery, &top)
+	if errGroup := group.Wait(); errGroup != nil {
+		return UsageObservabilityOverview{}, errGroup
+	}
+	usageObservabilityApplyTotalsParts(&totals, percentiles, activeCounts)
+
 	overview := UsageObservabilityOverview{
 		Range: UsageObservabilityOverviewRange{
 			From:     usageObservabilityRangeTimeFromBounds(query.From, bounds, true),
@@ -823,35 +901,47 @@ func (r *Repository) UsageObservabilityOverview(ctx context.Context, query Usage
 			Timezone: firstNonEmptyUsageObservabilityString(query.Timezone, "UTC"),
 			Interval: interval,
 		},
+		Live:            live,
 		Totals:          totals,
+		Trend:           trend,
 		CostBreakdown:   []UsageObservabilityCostBreakdownItem{},
-		ModelEfficiency: []UsageObservabilityAggregateItem{},
-	}
-	live, errLive := usageObservabilityLiveSQL(db, recordQuery, 300)
-	if errLive != nil {
-		return UsageObservabilityOverview{}, errLive
-	}
-	overview.Live = live
-	trend, errTrend := usageObservabilityTrendSQL(db, recordQuery, interval, location, bounds)
-	if errTrend != nil {
-		return UsageObservabilityOverview{}, errTrend
-	}
-	overview.Trend, errTrend = usageObservabilityFillTrend(trend, interval, location, query.From, query.To, bounds)
-	if errTrend != nil {
-		return UsageObservabilityOverview{}, errTrend
+		ModelEfficiency: modelEfficiency,
+		Top:             top,
 	}
 	overview.Activity = usageObservabilityActivity(overview.Trend)
-	modelEfficiency, errModelEfficiency := usageObservabilityAggregateItemsSQL(db, recordQuery, "model", "total_tokens", "desc", 10)
-	if errModelEfficiency != nil {
-		return UsageObservabilityOverview{}, errModelEfficiency
-	}
-	overview.ModelEfficiency = modelEfficiency
-	top, errTop := usageObservabilityTopSQL(db, recordQuery)
-	if errTop != nil {
-		return UsageObservabilityOverview{}, errTop
-	}
-	overview.Top = top
 	return overview, nil
+}
+
+// usageObservabilityTopSQLConcurrent schedules the same group queries as
+// usageObservabilityTopSQL on the caller's errgroup and writes the results into top.
+func usageObservabilityTopSQLConcurrent(group *errgroup.Group, db *gorm.DB, query UsageObservabilityRecordQuery, top *UsageObservabilityTopGroups) {
+	errorQuery := query
+	errorQuery.Status = "failed"
+	specs := []struct {
+		query   UsageObservabilityRecordQuery
+		groupBy string
+		metric  string
+		target  *[]UsageObservabilityAggregateItem
+	}{
+		{query, "user", "request_count", &top.Users},
+		{query, "client_key", "request_count", &top.ClientKeys},
+		{query, "credential", "request_count", &top.Credentials},
+		{query, "provider", "request_count", &top.Providers},
+		{query, "model", "request_count", &top.Models},
+		{query, "endpoint", "request_count", &top.Endpoints},
+		{errorQuery, "status_code", "failed_count", &top.Errors},
+	}
+	for index := range specs {
+		spec := specs[index]
+		group.Go(func() error {
+			items, errItems := usageObservabilityAggregateItemsSQL(db, spec.query, spec.groupBy, spec.metric, "desc", 10)
+			if errItems != nil {
+				return errItems
+			}
+			*spec.target = items
+			return nil
+		})
+	}
 }
 
 func (r *Repository) UsageObservabilityRealtime(ctx context.Context, query UsageObservabilityRealtimeQuery) (UsageObservabilityRealtimeSnapshot, error) {
@@ -924,16 +1014,67 @@ func usageObservabilityOverviewRecordQuery(query UsageObservabilityOverviewQuery
 }
 
 func usageObservabilityTotalsSQL(db *gorm.DB, query UsageObservabilityRecordQuery) (UsageObservabilityTotals, usageObservabilityOverviewBounds, error) {
+	totals, bounds, errBase := usageObservabilityTotalsBaseSQL(db, query)
+	if errBase != nil {
+		return UsageObservabilityTotals{}, usageObservabilityOverviewBounds{}, errBase
+	}
+	percentiles, errPercentiles := usageObservabilityLatencyPercentilesSQL(db, query)
+	if errPercentiles != nil {
+		return UsageObservabilityTotals{}, usageObservabilityOverviewBounds{}, errPercentiles
+	}
+	active, errActive := usageObservabilityActiveCountsSQL(db, query)
+	if errActive != nil {
+		return UsageObservabilityTotals{}, usageObservabilityOverviewBounds{}, errActive
+	}
+	usageObservabilityApplyTotalsParts(&totals, percentiles, active)
+	return totals, bounds, nil
+}
+
+// usageObservabilityTotalsBaseSQL returns the additive totals and the observed
+// bounds. Latency percentiles and active counts come from separate queries so
+// callers can run the three concurrently.
+func usageObservabilityTotalsBaseSQL(db *gorm.DB, query UsageObservabilityRecordQuery) (UsageObservabilityTotals, usageObservabilityOverviewBounds, error) {
 	var row usageObservabilityTotalsRow
 	scope := usageObservabilityRecordScope(db.Table("usage"), query)
 	if errScan := scope.Session(&gorm.Session{}).Select(usageObservabilityTotalsSQLSelect()).Scan(&row).Error; errScan != nil {
 		return UsageObservabilityTotals{}, usageObservabilityOverviewBounds{}, errScan
 	}
-	totals := usageObservabilityTotalsFromRow(&row)
-	percentiles, errPercentiles := usageObservabilityLatencyPercentilesSQL(db, query)
-	if errPercentiles != nil {
-		return UsageObservabilityTotals{}, usageObservabilityOverviewBounds{}, errPercentiles
-	}
+	bounds := usageObservabilityOverviewBounds{MinTimestamp: row.MinTimestamp, MaxTimestamp: row.MaxTimestamp}
+	return usageObservabilityTotalsFromRow(&row), bounds, nil
+}
+
+type usageObservabilityActiveCountsRow struct {
+	ActiveUserCount       int64 `gorm:"column:active_user_count"`
+	ActiveClientKeyCount  int64 `gorm:"column:active_client_key_count"`
+	ActiveCredentialCount int64 `gorm:"column:active_credential_count"`
+	ActiveModelCount      int64 `gorm:"column:active_model_count"`
+}
+
+// usageObservabilityActiveCountsSQL counts distinct users, client keys,
+// credentials and models in the window. Computing four COUNT(DISTINCT ...) over
+// the raw rows made Postgres sort the whole window once per aggregate (spilling
+// to disk past a week). These columns have few distinct values, so grouping
+// first collapses the window to a handful of rows with a hash aggregate. The
+// outer COUNT(DISTINCT ...) still skips NULLs, so the counts are unchanged.
+func usageObservabilityActiveCountsSQL(db *gorm.DB, query UsageObservabilityRecordQuery) (usageObservabilityActiveCountsRow, error) {
+	credentialExpr := `NULLIF(` + usageObservabilitySQLCredentialID() + `, '')`
+	grouped := usageObservabilityRecordScope(db.Table("usage"), query).Session(&gorm.Session{}).
+		Select(fmt.Sprintf(`
+		COALESCE("billing_charge"."user_id", "api_key"."user_id") AS active_user,
+		COALESCE("billing_charge"."api_key_id", "api_key"."id") AS active_client_key,
+		%s AS active_credential,
+		NULLIF("usage"."model", '') AS active_model`, credentialExpr)).
+		Group("1, 2, 3, 4")
+	var row usageObservabilityActiveCountsRow
+	errScan := db.Table("(?) AS active_groups", grouped).Select(`
+		COUNT(DISTINCT active_groups.active_user) AS active_user_count,
+		COUNT(DISTINCT active_groups.active_client_key) AS active_client_key_count,
+		COUNT(DISTINCT active_groups.active_credential) AS active_credential_count,
+		COUNT(DISTINCT active_groups.active_model) AS active_model_count`).Scan(&row).Error
+	return row, errScan
+}
+
+func usageObservabilityApplyTotalsParts(totals *UsageObservabilityTotals, percentiles usageObservabilityLatencyPercentileRow, active usageObservabilityActiveCountsRow) {
 	if percentiles.P50LatencyMS.Valid {
 		p50 := percentiles.P50LatencyMS.Float64
 		totals.P50LatencyMS = &p50
@@ -942,12 +1083,13 @@ func usageObservabilityTotalsSQL(db *gorm.DB, query UsageObservabilityRecordQuer
 		p95 := percentiles.P95LatencyMS.Float64
 		totals.P95LatencyMS = &p95
 	}
-	bounds := usageObservabilityOverviewBounds{MinTimestamp: row.MinTimestamp, MaxTimestamp: row.MaxTimestamp}
-	return totals, bounds, nil
+	totals.ActiveUserCount = active.ActiveUserCount
+	totals.ActiveClientKeyCount = active.ActiveClientKeyCount
+	totals.ActiveCredentialCount = active.ActiveCredentialCount
+	totals.ActiveModelCount = active.ActiveModelCount
 }
 
 func usageObservabilityTotalsSQLSelect() string {
-	credentialExpr := `NULLIF(` + usageObservabilitySQLCredentialID() + `, '')`
 	cacheReadTokensExpr := usageObservabilitySQLCacheReadTokens(`"usage"`)
 	accountingTotalTokensExpr := usageObservabilitySQLAccountingTotalTokens(`"usage"`)
 	return fmt.Sprintf(`
@@ -976,14 +1118,11 @@ func usageObservabilityTotalsSQLSelect() string {
 		SUM("usage"."accounting_reasoning_tokens") AS accounting_reasoning_tokens,
 		SUM("usage"."unclassified_tokens") AS unclassified_tokens,
 		SUM("billing_charge"."amount") AS total_amount,
+		SUM(CASE WHEN "billing_charge"."matched_price_rule" = 'default:zero' THEN 1 ELSE 0 END) AS unpriced_requests,
 		AVG(CASE WHEN "usage"."latency_ms" >= 0 THEN "usage"."latency_ms" END) AS avg_latency_ms,
 		AVG(CASE WHEN "usage"."ttft_ms" > 0 THEN "usage"."ttft_ms" END) AS avg_ttft_ms,
-		COUNT(DISTINCT COALESCE("billing_charge"."user_id", "api_key"."user_id")) AS active_user_count,
-		COUNT(DISTINCT COALESCE("billing_charge"."api_key_id", "api_key"."id")) AS active_client_key_count,
-		COUNT(DISTINCT %s) AS active_credential_count,
-		COUNT(DISTINCT NULLIF("usage"."model", '')) AS active_model_count,
 		MIN("usage"."timestamp") AS min_timestamp,
-		MAX("usage"."timestamp") AS max_timestamp`, cacheReadTokensExpr, accountingTotalTokensExpr, credentialExpr)
+		MAX("usage"."timestamp") AS max_timestamp`, cacheReadTokensExpr, accountingTotalTokensExpr)
 }
 
 func usageObservabilityTotalsFromRow(row *usageObservabilityTotalsRow) UsageObservabilityTotals {
@@ -1026,6 +1165,9 @@ func usageObservabilityTotalsFromRow(row *usageObservabilityTotalsRow) UsageObse
 		amount := row.TotalAmount.Float64
 		totals.TotalAmount = &amount
 		totals.Currency = UsageObservabilityCurrencyCredits
+	}
+	if row.UnpricedRequests.Valid {
+		totals.UnpricedRequests = row.UnpricedRequests.Int64
 	}
 	if row.AvgLatencyMS.Valid {
 		avg := row.AvgLatencyMS.Float64
@@ -1735,6 +1877,9 @@ func usageObservabilityAggregateBaseQuery(db *gorm.DB, query UsageObservabilityR
 
 func usageObservabilityAggregateP95Query(db *gorm.DB, query UsageObservabilityRecordQuery, groupBy string) *gorm.DB {
 	base := usageObservabilityAggregateBaseQuery(db, query, groupBy)
+	if usageObservabilityIsPostgres(db) {
+		return usageObservabilityAggregateP95PercentileQuery(db, base)
+	}
 	ranked := db.Table("(?) AS scoped_latency", base).
 		Select(`
 			scoped_latency.aggregate_id AS aggregate_id,
@@ -1748,29 +1893,49 @@ func usageObservabilityAggregateP95Query(db *gorm.DB, query UsageObservabilityRe
 		Group("ranked_latency.aggregate_id")
 }
 
+// usageObservabilityAggregateP95PercentileQuery computes the per-group p95 with
+// percentile_disc on Postgres. It returns the first latency whose position in the
+// ascending order reaches 95% of the group, the same value the window-function
+// ranking below selects, without ranking every row in a separate sort.
+func usageObservabilityAggregateP95PercentileQuery(db *gorm.DB, base *gorm.DB) *gorm.DB {
+	return db.Table("(?) AS scoped_latency", base).
+		Select("scoped_latency.aggregate_id AS aggregate_id, percentile_disc(0.95) WITHIN GROUP (ORDER BY scoped_latency.latency_ms) AS p95_latency_ms").
+		Where("scoped_latency.latency_ms >= ?", 0).
+		Group("scoped_latency.aggregate_id")
+}
+
+func usageObservabilityIsPostgres(db *gorm.DB) bool {
+	return db != nil && db.Dialector != nil && db.Dialector.Name() == "postgres"
+}
+
 func usageObservabilityAggregateP95Values(db *gorm.DB, query UsageObservabilityRecordQuery, groupBy string, aggregateIDs []string) (map[string]sql.NullFloat64, error) {
 	if len(aggregateIDs) == 0 {
 		return map[string]sql.NullFloat64{}, nil
 	}
 	base := usageObservabilityAggregateBaseQuery(db, query, groupBy)
-	ranked := db.Table("(?) AS scoped_latency", base).
-		Select(`
-			scoped_latency.aggregate_id AS aggregate_id,
-			scoped_latency.latency_ms AS latency_ms,
-			COUNT(*) OVER (PARTITION BY scoped_latency.aggregate_id) AS latency_count,
-			ROW_NUMBER() OVER (PARTITION BY scoped_latency.aggregate_id ORDER BY scoped_latency.latency_ms ASC) AS latency_rank`).
-		Where("scoped_latency.latency_ms >= ?", 0).
-		Where("scoped_latency.aggregate_id IN ?", aggregateIDs)
-
 	var rows []struct {
 		AggregateID  string          `gorm:"column:aggregate_id"`
 		P95LatencyMS sql.NullFloat64 `gorm:"column:p95_latency_ms"`
 	}
-	if errScan := db.Table("(?) AS ranked_latency", ranked).
-		Select("ranked_latency.aggregate_id AS aggregate_id, MIN(ranked_latency.latency_ms) AS p95_latency_ms").
-		Where("ranked_latency.latency_rank * 100 >= ranked_latency.latency_count * 95").
-		Group("ranked_latency.aggregate_id").
-		Scan(&rows).Error; errScan != nil {
+	var p95Query *gorm.DB
+	if usageObservabilityIsPostgres(db) {
+		p95Query = usageObservabilityAggregateP95PercentileQuery(db, base).
+			Where("scoped_latency.aggregate_id IN ?", aggregateIDs)
+	} else {
+		ranked := db.Table("(?) AS scoped_latency", base).
+			Select(`
+			scoped_latency.aggregate_id AS aggregate_id,
+			scoped_latency.latency_ms AS latency_ms,
+			COUNT(*) OVER (PARTITION BY scoped_latency.aggregate_id) AS latency_count,
+			ROW_NUMBER() OVER (PARTITION BY scoped_latency.aggregate_id ORDER BY scoped_latency.latency_ms ASC) AS latency_rank`).
+			Where("scoped_latency.latency_ms >= ?", 0).
+			Where("scoped_latency.aggregate_id IN ?", aggregateIDs)
+		p95Query = db.Table("(?) AS ranked_latency", ranked).
+			Select("ranked_latency.aggregate_id AS aggregate_id, MIN(ranked_latency.latency_ms) AS p95_latency_ms").
+			Where("ranked_latency.latency_rank * 100 >= ranked_latency.latency_count * 95").
+			Group("ranked_latency.aggregate_id")
+	}
+	if errScan := p95Query.Scan(&rows).Error; errScan != nil {
 		return nil, errScan
 	}
 	out := make(map[string]sql.NullFloat64, len(rows))
@@ -1876,7 +2041,8 @@ func usageObservabilityAggregateBaseSelect(groupBy string) string {
 		"usage"."unclassified_tokens" AS unclassified_tokens,
 		%s AS cache_rate_tokens,
 		%s AS cache_rate_total_tokens,
-		"billing_charge"."amount" AS amount`,
+		"billing_charge"."amount" AS amount,
+		"billing_charge"."matched_price_rule" AS matched_price_rule`,
 		idExpr,
 		labelExpr,
 		clientUserIDExpr,
@@ -2030,6 +2196,7 @@ func usageObservabilityAggregateSQLSelect(includeP95 bool) string {
 		SUM(scoped.accounting_reasoning_tokens) AS accounting_reasoning_tokens,
 		SUM(scoped.unclassified_tokens) AS unclassified_tokens,
 		SUM(scoped.amount) AS total_amount,
+		SUM(CASE WHEN scoped.matched_price_rule = 'default:zero' THEN 1 ELSE 0 END) AS unpriced_requests,
 		AVG(CASE WHEN scoped.latency_ms >= 0 THEN scoped.latency_ms END) AS avg_latency_ms,
 		%s,
 		MAX(scoped.timestamp) AS last_used_at`, p95Select)
@@ -2822,6 +2989,7 @@ func usageObservabilityAggregateItemFromRow(row *usageObservabilityAggregateRow,
 		item.TotalAmount = &amount
 		item.Currency = UsageObservabilityCurrencyCredits
 	}
+	item.UnpricedRequests = row.UnpricedRequests
 	if row.AvgLatencyMS.Valid {
 		avg := row.AvgLatencyMS.Float64
 		item.AvgLatencyMS = &avg
